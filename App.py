@@ -488,7 +488,7 @@ class CampaignGenerator:
                         "content": prompt
                     }
                 ],
-                model="llama3-8b-8192",  # Using a working Groq model
+                model="openai/gpt-oss-20b",  # Using a working Groq model
                 temperature=0.7,
                 max_tokens=4000
             )
@@ -536,7 +536,7 @@ class CampaignGenerator:
                         "content": prompt
                     }
                 ],
-                model="llama3-8b-8192",
+                model="openai/gpt-oss-20b",
                 temperature=0.6,
                 max_tokens=3000
             )
