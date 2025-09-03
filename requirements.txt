@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+plotly
+email-validator
+python-dotenv
+openpyxl
