@@ -4,8 +4,6 @@ numpy
 plotly
 email-validator
 python-dotenv
-openpyxl
-groq
-google-genai
+huggingface_hub
 Pillow
 requests
