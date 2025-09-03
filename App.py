@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 import io
 import base64
 from groq import Groq
-import google.generativeai as genai
 import requests
 from PIL import Image
 
@@ -28,11 +27,6 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Configure Gemini AI
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 # Countries and Currencies data with coordinates
 COUNTRIES_DATA = {
@@ -83,44 +77,6 @@ def initialize_session_state():
 # UTILITY CLASSES
 # ================================
 
-class GeminiImageGenerator:
-    """Generate images using Gemini AI"""
-    
-    def _init_(self):
-        self.model = None
-        if GEMINI_API_KEY:
-            try:
-                self.model = genai.GenerativeModel('gemini-pro')
-            except Exception as e:
-                st.error(f"Failed to initialize Gemini: {e}")
-    
-    def generate_campaign_image(self, campaign_description, style="professional"):
-        """Generate campaign image using Gemini"""
-        if not GEMINI_API_KEY:
-            st.warning("Gemini API key not configured")
-            return None
-            
-        try:
-            # For now, return placeholder since Gemini Pro doesn't generate images directly
-            # You would need Gemini Pro Vision or use DALL-E through the API
-            st.info("Image generation with Gemini requires additional setup. Using placeholder.")
-            
-            # Create a placeholder image URL
-            image_prompt = f"Professional marketing campaign image for: {campaign_description}, style: {style}"
-            
-            # Store the prompt for later use
-            st.session_state.generated_images.append({
-                'prompt': image_prompt,
-                'timestamp': datetime.now(),
-                'campaign': campaign_description
-            })
-            
-            return image_prompt
-            
-        except Exception as e:
-            st.error(f"Error generating image: {e}")
-            return None
-
 class EmailPersonalizer:
     """Handle intelligent email personalization"""
     
@@ -152,7 +108,7 @@ class EmailPersonalizer:
 class EmailHandler:
     """Fixed email handling with proper error handling"""
     
-    def _init_(self):
+    def __init__(self):
         self.smtp_server = "smtp.gmail.com"
         self.smtp_port = 587
         self.email = GMAIL_USER
@@ -266,7 +222,7 @@ class EmailHandler:
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("✅ Sent", sent_count)
                 col2.metric("❌ Failed", failed_count)
-                col3.metric("⚠ Invalid", invalid_count)
+                col3.metric("⚠️ Invalid", invalid_count)
                 col4.metric("📊 Progress", f"{progress * 100:.1f}%")
             
             # Delay to avoid rate limiting
@@ -281,7 +237,7 @@ class EmailHandler:
 class FileProcessor:
     """Process files and extract contacts"""
     
-    def _init_(self):
+    def __init__(self):
         self.email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
         self.personalizer = EmailPersonalizer()
     
@@ -357,7 +313,7 @@ class FileProcessor:
 class CampaignGenerator:
     """Generate campaigns using Groq API"""
     
-    def _init_(self):
+    def __init__(self):
         self.client = None
         if GROQ_API_KEY:
             try:
@@ -384,7 +340,7 @@ class CampaignGenerator:
                         "content": prompt
                     }
                 ],
-                model="openai/gpt-oss-20b",
+                model="llama3-8b-8192",
                 temperature=0.7,
                 max_tokens=4000
             )
@@ -400,14 +356,14 @@ class CampaignGenerator:
         return f"""
         Create a comprehensive marketing campaign blueprint for:
         
-        *Company:* {data.get('company_name', 'Company')}
-        *Campaign Type:* {data.get('campaign_type', 'Marketing')}
-        *Target Audience:* {data.get('target_audience', 'General')}
-        *Location:* {data.get('location', 'Global')} {data.get('city_state', '')}
-        *Channels:* {', '.join(data.get('channels', []))}
-        *Budget:* {data.get('budget', 'TBD')} {data.get('currency', 'USD')}
-        *Duration:* {data.get('duration', 'TBD')}
-        *Product:* {data.get('product_description', 'Product/Service')}
+        **Company:** {data.get('company_name', 'Company')}
+        **Campaign Type:** {data.get('campaign_type', 'Marketing')}
+        **Target Audience:** {data.get('target_audience', 'General')}
+        **Location:** {data.get('location', 'Global')} {data.get('city_state', '')}
+        **Channels:** {', '.join(data.get('channels', []))}
+        **Budget:** {data.get('budget', 'TBD')} {data.get('currency', 'USD')}
+        **Duration:** {data.get('duration', 'TBD')}
+        **Product:** {data.get('product_description', 'Product/Service')}
         
         Provide:
         1. Executive Summary
@@ -427,11 +383,11 @@ class CampaignGenerator:
 # {data.get('company_name', 'Your Company')} Marketing Campaign
 
 ## Campaign Overview
-- *Type:* {data.get('campaign_type', 'Marketing Campaign')}
-- *Target:* {data.get('target_audience', 'General Audience')}
-- *Location:* {data.get('location', 'Global')}
-- *Duration:* {data.get('duration', 'To be determined')}
-- *Budget:* {data.get('budget', 'TBD')} {data.get('currency', 'USD')}
+- **Type:** {data.get('campaign_type', 'Marketing Campaign')}
+- **Target:** {data.get('target_audience', 'General Audience')}
+- **Location:** {data.get('location', 'Global')}
+- **Duration:** {data.get('duration', 'To be determined')}
+- **Budget:** {data.get('budget', 'TBD')} {data.get('currency', 'USD')}
 
 ## Objectives
 - Increase brand awareness
@@ -537,7 +493,7 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
-    # FIXED Navigation - Using session state instead of st.switch_page
+    # Navigation
     with st.sidebar:
         st.markdown("### 🎯 Navigation")
         
@@ -569,17 +525,12 @@ def main():
         else:
             st.error("📧 Email Service: Not configured")
         
-        if GEMINI_API_KEY:
-            st.success("🎨 Image Generator: Connected")
-        else:
-            st.warning("🎨 Image Generator: Not configured")
-        
         st.markdown("---")
         
         # Current campaign info
         if st.session_state.current_campaign:
             st.markdown("### 🎯 Active Campaign")
-            st.info(f"{st.session_state.current_campaign['company_name']}")
+            st.info(f"**{st.session_state.current_campaign['company_name']}**")
             st.caption(f"Type: {st.session_state.current_campaign['campaign_type']}")
             st.caption(f"Location: {st.session_state.current_campaign['location']}")
         
@@ -622,7 +573,7 @@ def show_campaign_dashboard():
             ])
             
             location = st.selectbox("🌍 Target Country", COUNTRIES)
-            city_state = st.text_input("🏙 City/State", placeholder="e.g., New York, NY")
+            city_state = st.text_input("🏙️ City/State", placeholder="e.g., New York, NY")
             customer_segment = st.selectbox("💼 Customer Segment", 
                 ["Mass Market", "Premium", "Niche", "Enterprise", "SMB"])
         
@@ -638,9 +589,6 @@ def show_campaign_dashboard():
         
         # Generate campaign button
         generate_campaign = st.form_submit_button("🚀 Generate AI Campaign Strategy", use_container_width=True)
-        
-        # Generate campaign image button
-        generate_image = st.form_submit_button("🎨 Generate Campaign Image", use_container_width=True)
     
     # Handle campaign generation
     if generate_campaign and company_name and campaign_type:
@@ -668,17 +616,6 @@ def show_campaign_dashboard():
             
             st.success("✨ Campaign strategy generated!")
             st.balloons()
-    
-    # Handle image generation
-    if generate_image and st.session_state.current_campaign:
-        with st.spinner("🎨 Generating campaign image..."):
-            image_gen = GeminiImageGenerator()
-            campaign_desc = f"{st.session_state.current_campaign['company_name']} {st.session_state.current_campaign['campaign_type']}"
-            image_prompt = image_gen.generate_campaign_image(campaign_desc)
-            
-            if image_prompt:
-                st.success("🎨 Campaign image concept generated!")
-                st.info(f"Image concept: {image_prompt}")
     
     # Display existing campaign
     if st.session_state.campaign_blueprint:
@@ -709,7 +646,7 @@ def show_email_marketing():
     
     # Show active campaign
     if st.session_state.current_campaign:
-        st.success(f"🎯 Active: *{st.session_state.current_campaign['company_name']}* - {st.session_state.current_campaign['campaign_type']}")
+        st.success(f"🎯 Active: **{st.session_state.current_campaign['company_name']}** - {st.session_state.current_campaign['campaign_type']}")
     
     # Email template generation
     st.subheader("🎨 Generate Email Content")
@@ -776,7 +713,7 @@ The {st.session_state.current_campaign['company_name'] if st.session_state.curre
                 
                 st.success("✨ Email content generated!")
             else:
-                st.warning("⚠ Create a campaign first")
+                st.warning("⚠️ Create a campaign first")
     
     # Template editor
     if st.session_state.email_template or st.session_state.plain_text_template:
@@ -834,7 +771,7 @@ The {st.session_state.current_campaign['company_name'] if st.session_state.curre
             )
             st.session_state.email_contacts = edited_contacts
     
-    # FIXED Email campaign launch
+    # Email campaign launch
     if (st.session_state.email_contacts is not None and 
         (st.session_state.email_template or st.session_state.plain_text_template)):
         
@@ -891,7 +828,7 @@ The {st.session_state.current_campaign['company_name'] if st.session_state.curre
             else:
                 st.error(f"❌ Test failed: {error_msg}")
         
-        # FIXED Launch button
+        # Launch button
         st.markdown("### 🎯 Campaign Launch")
         
         if st.button("🚀 LAUNCH EMAIL CAMPAIGN", type="primary", use_container_width=True, key="launch_campaign"):
@@ -906,7 +843,7 @@ GMAIL_APP_PASSWORD=your_16_digit_app_password
                 st.stop()
             
             # Confirmation
-            st.warning(f"⚠ About to send {len(df)} emails. This cannot be undone!")
+            st.warning(f"⚠️ About to send {len(df)} emails. This cannot be undone!")
             
             # Use a unique key for the confirmation button
             confirm_key = f"confirm_launch_{datetime.now().timestamp()}"
@@ -939,7 +876,7 @@ GMAIL_APP_PASSWORD=your_16_digit_app_password
                     with result_col2:
                         st.metric("❌ Failed", failed_count)
                     with result_col3:
-                        st.metric("⚠ Invalid", invalid_count)
+                        st.metric("⚠️ Invalid", invalid_count)
                     with result_col4:
                         st.metric("📊 Success Rate", f"{success_rate:.1f}%")
                     
@@ -964,7 +901,7 @@ def show_analytics_reports():
     
     # Show campaign-based map if campaign exists
     if st.session_state.current_campaign:
-        st.subheader("🗺 Campaign Geographic Analysis")
+        st.subheader("🗺️ Campaign Geographic Analysis")
         
         campaign = st.session_state.current_campaign
         location = campaign['location']
@@ -1168,15 +1105,19 @@ def show_analytics_reports():
     
     else:
         st.info("""
-        📊 *Analytics Dashboard*
+        📊 **Analytics Dashboard**
         
-        - *Campaign Map*: Shows your target location when a campaign is created
-        - *Projections*: Estimates based on your campaign budget and parameters  
-        - *Email Results*: Real results from sent email campaigns
-        - *Data Upload*: Upload your own performance data for custom analysis
+        - **Campaign Map**: Shows your target location when a campaign is created
+        - **Projections**: Estimates based on your campaign budget and parameters  
+        - **Email Results**: Real results from sent email campaigns
+        - **Data Upload**: Upload your own performance data for custom analysis
         
         Create a campaign to see geographic targeting and projections!
         """)
 
-if _name_ == "_main_":
+# ================================
+# FIXED MAIN GUARD
+# ================================
+
+if __name__ == "__main__":  # FIXED: Changed from _name_ to __name__
     main()
