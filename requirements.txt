@@ -6,5 +6,6 @@ email-validator
 python-dotenv
 openpyxl
 groq
-google-generativeai
+google-genai
 Pillow
+requests
