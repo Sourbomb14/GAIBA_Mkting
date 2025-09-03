@@ -7,3 +7,4 @@ python-dotenv
 huggingface_hub
 Pillow
 requests
+openpyxl
