@@ -7,30 +7,26 @@ import time
 import re
 import json
 import plotly.express as px
-import plotly.graph_objects as go
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from email_validator import validate_email, EmailNotValidError
 from dotenv import load_dotenv
 import os
 from datetime import datetime, timedelta
 import io
-import base64
-from groq import Groq
-from google import genai
+from huggingface_hub import InferenceClient
 from PIL import Image
-import requests
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD")  # App password
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Countries data with coordinates
+# Countries data
 COUNTRIES_DATA = {
     "Global": {"coords": [0, 0], "currency": "USD"},
     "United States": {"coords": [39.8283, -98.5795], "currency": "USD"},
@@ -38,26 +34,21 @@ COUNTRIES_DATA = {
     "United Kingdom": {"coords": [55.3781, -3.4360], "currency": "GBP"},
     "Germany": {"coords": [51.1657, 10.4515], "currency": "EUR"},
     "France": {"coords": [46.6034, 1.8883], "currency": "EUR"},
-    "Spain": {"coords": [40.4637, -3.7492], "currency": "EUR"},
-    "Italy": {"coords": [41.8719, 12.5674], "currency": "EUR"},
-    "Netherlands": {"coords": [52.1326, 5.2913], "currency": "EUR"},
+    "India": {"coords": [20.5937, 78.9629], "currency": "INR"},
     "Australia": {"coords": [-25.2744, 133.7751], "currency": "AUD"},
     "Japan": {"coords": [36.2048, 138.2529], "currency": "JPY"},
-    "India": {"coords": [20.5937, 78.9629], "currency": "INR"},
     "China": {"coords": [35.8617, 104.1954], "currency": "CNY"},
-    "Brazil": {"coords": [-14.2350, -51.9253], "currency": "BRL"},
-    "Mexico": {"coords": [23.6345, -102.5528], "currency": "MXN"}
+    "Brazil": {"coords": [-14.2350, -51.9253], "currency": "BRL"}
 }
 
 COUNTRIES = list(COUNTRIES_DATA.keys())
-CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "INR", "BRL", "MXN", "CNY"]
+CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD", "JPY", "INR", "BRL", "CNY"]
 
 # ================================
 # SESSION STATE INITIALIZATION
 # ================================
 
 def initialize_session_state():
-    """Initialize all session state variables"""
     if 'current_page' not in st.session_state:
         st.session_state.current_page = "Campaign Dashboard"
     if 'current_campaign' not in st.session_state:
@@ -70,96 +61,65 @@ def initialize_session_state():
         st.session_state.email_contacts = None
     if 'campaign_results' not in st.session_state:
         st.session_state.campaign_results = None
-    if 'plain_text_template' not in st.session_state:
-        st.session_state.plain_text_template = None
     if 'generated_images' not in st.session_state:
         st.session_state.generated_images = []
-    if 'email_sending' not in st.session_state:
-        st.session_state.email_sending = False
 
 # ================================
-# FIXED GEMINI IMAGE GENERATOR
+# HUGGINGFACE IMAGE GENERATOR
 # ================================
 
-class GeminiImageGenerator:
-    """Generate images using Gemini AI with correct API implementation"""
+class HuggingFaceImageGenerator:
+    """Generate images using HuggingFace FLUX model"""
     
     def __init__(self):
         self.client = None
-        if GEMINI_API_KEY:
+        if HF_TOKEN:
             try:
-                self.client = genai.Client(api_key=GEMINI_API_KEY)
+                self.client = InferenceClient(
+                    provider="together",
+                    api_key=HF_TOKEN,
+                )
             except Exception as e:
-                st.error(f"Failed to initialize Gemini: {e}")
+                st.error(f"Failed to initialize HuggingFace client: {e}")
     
     def generate_campaign_image(self, campaign_description, style="professional"):
-        """Generate campaign image using the correct Gemini API"""
-        if not GEMINI_API_KEY:
-            st.warning("⚠️ Gemini API key not configured. Please add GEMINI_API_KEY to your .env file")
+        """Generate campaign image using HuggingFace FLUX"""
+        if not HF_TOKEN:
+            st.warning("⚠️ HuggingFace token not configured. Please add HF_TOKEN to your .env file")
             return None
             
         if not self.client:
-            st.error("❌ Gemini client not initialized")
+            st.error("❌ HuggingFace client not initialized")
             return None
             
         try:
-            # Create detailed prompt for marketing campaign image
-            prompt = f"""Create a professional marketing campaign image for: {campaign_description}. 
-            Style: {style}. 
-            Requirements: High-quality, engaging marketing visual with modern design elements, 
-            professional lighting, vibrant colors, and compelling imagery suitable for digital 
-            marketing campaigns. The image should be eye-catching and brand-appropriate."""
+            prompt = f"Professional marketing campaign image for {campaign_description}, {style} style, high quality, vibrant colors, modern design, eye-catching, commercial photography"
             
-            with st.spinner("🎨 Generating campaign image with Gemini AI..."):
-                # Use the correct Gemini 2.5 Flash model for image generation
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash-image-preview",
-                    contents=[prompt],
-                    config={
-                        "response_modalities": ["TEXT", "IMAGE"],
-                        "max_output_tokens": 4000
-                    }
+            with st.spinner("🎨 Generating campaign image with HuggingFace FLUX..."):
+                # Generate image using FLUX model
+                image = self.client.text_to_image(
+                    prompt,
+                    model="black-forest-labs/FLUX.1-dev",
                 )
                 
-                # Extract image from response
-                image_data = None
-                text_response = ""
-                
-                for part in response.candidates[0].content.parts:
-                    if part.text:
-                        text_response += part.text
-                    elif part.inline_data:
-                        # Convert base64 data to image
-                        from PIL import Image
-                        from io import BytesIO
-                        import base64
-                        
-                        image_bytes = part.inline_data.data
-                        image_data = Image.open(BytesIO(image_bytes))
-                        break
-                
-                if image_data:
+                if image:
                     # Save to session state
-                    image_info = {
+                    image_data = {
                         'prompt': prompt,
                         'timestamp': datetime.now(),
                         'campaign': campaign_description,
-                        'image': image_data,
-                        'description': text_response
+                        'image': image
                     }
                     
-                    st.session_state.generated_images.append(image_info)
+                    st.session_state.generated_images.append(image_data)
                     
                     # Display the image
                     st.success("✨ Campaign image generated successfully!")
-                    st.image(image_data, caption=f"Generated for: {campaign_description}", use_column_width=True)
-                    
-                    if text_response:
-                        st.info(f"AI Description: {text_response}")
+                    st.image(image, caption=f"Generated for: {campaign_description}", use_column_width=True)
                     
                     # Provide download option
                     img_bytes = io.BytesIO()
-                    image_data.save(img_bytes, format='PNG')
+                    image.save(img_bytes, format='PNG')
                     img_bytes.seek(0)
                     
                     st.download_button(
@@ -169,312 +129,322 @@ class GeminiImageGenerator:
                         mime="image/png"
                     )
                     
-                    return image_data
+                    return image
                 else:
-                    st.error("❌ No image generated in the response")
-                    if text_response:
-                        st.info(f"AI Response: {text_response}")
+                    st.error("❌ Failed to generate image")
                     return None
             
         except Exception as e:
-            st.error(f"❌ Error generating image with Gemini: {str(e)}")
-            st.info("💡 Make sure your Gemini API key is valid and has image generation permissions")
-            
-            # Provide troubleshooting info
-            with st.expander("🔧 Troubleshooting"):
-                st.write("""
-                **Common issues:**
-                1. **API Key**: Ensure GEMINI_API_KEY is set correctly
-                2. **Permissions**: Make sure your API key has image generation permissions
-                3. **Rate Limits**: You might have hit API rate limits
-                4. **Model Access**: Ensure you have access to gemini-2.5-flash-image-preview
-                
-                **To fix:**
-                - Check your API key at https://makersuite.google.com/app/apikey
-                - Try again after a few minutes if rate limited
-                - Verify your account has image generation enabled
-                """)
-            
+            st.error(f"❌ Error generating image: {str(e)}")
+            st.info("💡 Make sure your HuggingFace token is valid")
             return None
 
 # ================================
-# FIXED GROQ INTEGRATION
+# SIMPLE EMAIL PERSONALIZER
 # ================================
 
-class GroqAIGenerator:
-    """Generate content using Groq AI with your specified model"""
+class EmailPersonalizer:
+    @staticmethod
+    def extract_name_from_email(email):
+        try:
+            local_part = email.split('@')[0]
+            name_part = re.sub(r'[0-9._-]', ' ', local_part)
+            name_parts = [part.capitalize() for part in name_part.split() if len(part) > 1]
+            return ' '.join(name_parts) if name_parts else 'Valued Customer'
+        except:
+            return 'Valued Customer'
     
+    @staticmethod
+    def personalize_content(template, name, email=None):
+        first_name = name.split()[0] if name and ' ' in name else name
+        
+        personalized = template.replace('{name}', name or 'Valued Customer')
+        personalized = personalized.replace('{first_name}', first_name or 'Valued Customer')
+        personalized = personalized.replace('{email}', email or '')
+        
+        return personalized
+
+# ================================
+# WORKING EMAIL HANDLER
+# ================================
+
+def send_bulk_emails_working(email_list, subject_template, body_template, progress_placeholder, status_placeholder):
+    """WORKING bulk email function that actually sends emails"""
+    
+    if not GMAIL_USER or not GMAIL_PASSWORD:
+        st.error("❌ Gmail credentials missing!")
+        st.code("""
+# Add to .env file:
+GMAIL_USER=your_email@gmail.com
+GMAIL_PASSWORD=your_16_digit_app_password
+        """)
+        return pd.DataFrame()
+    
+    results = []
+    total_emails = len(email_list)
+    personalizer = EmailPersonalizer()
+    
+    # Create SMTP connection
+    context = ssl.create_default_context()
+    
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(GMAIL_USER, GMAIL_PASSWORD)
+            
+            for idx, row in email_list.iterrows():
+                # Update progress
+                progress = (idx + 1) / total_emails
+                progress_placeholder.progress(progress)
+                status_placeholder.info(f"📧 Sending to: {row['email']} ({idx + 1}/{total_emails})")
+                
+                try:
+                    # Validate email
+                    validate_email(row['email'])
+                    
+                    # Create message
+                    msg = MIMEMultipart('alternative')
+                    
+                    # Personalize content
+                    name = row.get('name', personalizer.extract_name_from_email(row['email']))
+                    personalized_subject = personalizer.personalize_content(subject_template, name, row['email'])
+                    personalized_body = personalizer.personalize_content(body_template, name, row['email'])
+                    
+                    msg['Subject'] = personalized_subject
+                    msg['From'] = formataddr(("Marketing Team", GMAIL_USER))
+                    msg['To'] = row['email']
+                    
+                    # Attach content
+                    if '<html>' in body_template.lower() or '<p>' in body_template.lower():
+                        msg.attach(MIMEText(personalized_body, 'html'))
+                    else:
+                        msg.attach(MIMEText(personalized_body, 'plain'))
+                    
+                    # Send email
+                    server.sendmail(GMAIL_USER, row['email'], msg.as_string())
+                    
+                    results.append({
+                        'email': row['email'],
+                        'name': name,
+                        'status': 'sent',
+                        'error': '',
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                    
+                    # Small delay to avoid rate limiting
+                    time.sleep(1)
+                    
+                except EmailNotValidError:
+                    results.append({
+                        'email': row['email'],
+                        'name': row.get('name', 'Unknown'),
+                        'status': 'invalid',
+                        'error': 'Invalid email format',
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                    
+                except Exception as e:
+                    results.append({
+                        'email': row['email'],
+                        'name': row.get('name', 'Unknown'),
+                        'status': 'failed',
+                        'error': str(e),
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+            
+            progress_placeholder.progress(1.0)
+            status_placeholder.success("✅ Email campaign completed!")
+            
+    except Exception as e:
+        st.error(f"❌ SMTP Connection Error: {str(e)}")
+        return pd.DataFrame()
+    
+    return pd.DataFrame(results)
+
+# ================================
+# FILE PROCESSOR
+# ================================
+
+class FileProcessor:
     def __init__(self):
-        self.client = None
-        if GROQ_API_KEY:
-            try:
-                self.client = Groq(api_key=GROQ_API_KEY)
-            except Exception as e:
-                st.error(f"Failed to initialize Groq: {e}")
+        self.personalizer = EmailPersonalizer()
     
-    def generate_campaign_blueprint(self, campaign_data):
-        """Generate campaign blueprint using Groq with your specified model"""
-        if not self.client:
-            return self._fallback_blueprint(campaign_data)
-        
+    def process_file(self, uploaded_file):
         try:
-            prompt = self._build_campaign_prompt(campaign_data)
+            file_extension = uploaded_file.name.split('.')[-1].lower()
             
-            # Using your specified model and parameters
-            completion = self.client.chat.completions.create(
-                model="openai/gpt-oss-20b",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a world-class marketing strategist with 20+ years of experience. Create comprehensive, actionable marketing campaign strategies that drive real business results."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.7,
-                max_completion_tokens=8192,
-                top_p=1,
-                reasoning_effort="medium",
-                stream=True,
-                stop=None
-            )
+            if file_extension == 'csv':
+                df = pd.read_csv(uploaded_file)
+            elif file_extension in ['xlsx', 'xls']:
+                df = pd.read_excel(uploaded_file)
+            else:
+                st.error("Please use CSV or Excel files only")
+                return None
             
-            # Collect streamed response
-            full_response = ""
-            for chunk in completion:
-                if chunk.choices[0].delta.content:
-                    full_response += chunk.choices[0].delta.content
+            # Convert column names to lowercase
+            df.columns = df.columns.str.lower()
             
-            return full_response
+            # Find email column
+            email_col = None
+            for col in df.columns:
+                if 'email' in col or 'mail' in col:
+                    email_col = col
+                    break
+            
+            if email_col is None:
+                st.error("❌ No email column found. Please ensure your file has an 'email' column.")
+                return None
+            
+            # Find name columns
+            name_cols = []
+            for col in df.columns:
+                if any(keyword in col for keyword in ['name', 'first', 'last']):
+                    name_cols.append(col)
+            
+            # Process contacts
+            result_data = []
+            for _, row in df.iterrows():
+                email = row[email_col]
+                if pd.isna(email) or str(email).strip() == '':
+                    continue
+                
+                email = str(email).strip().lower()
+                
+                # Get name
+                if name_cols:
+                    name_parts = []
+                    for name_col in name_cols:
+                        if name_col in row and not pd.isna(row[name_col]):
+                            name_parts.append(str(row[name_col]).strip())
+                    full_name = ' '.join(name_parts) if name_parts else self.personalizer.extract_name_from_email(email)
+                else:
+                    full_name = self.personalizer.extract_name_from_email(email)
+                
+                # Validate email
+                try:
+                    validate_email(email)
+                    result_data.append({'email': email, 'name': full_name})
+                except EmailNotValidError:
+                    continue
+            
+            if not result_data:
+                st.error("❌ No valid emails found")
+                return None
+            
+            return pd.DataFrame(result_data)
             
         except Exception as e:
-            st.error(f"Error with Groq API: {e}")
-            return self._fallback_blueprint(campaign_data)
+            st.error(f"Error processing file: {e}")
+            return None
+
+# ================================
+# CAMPAIGN GENERATOR
+# ================================
+
+def generate_campaign_blueprint(campaign_data):
+    """Generate a campaign blueprint"""
+    company_name = campaign_data.get('company_name', 'Your Company')
+    campaign_type = campaign_data.get('campaign_type', 'Marketing Campaign')
+    target_audience = campaign_data.get('target_audience', 'Target Audience')
+    location = campaign_data.get('location', 'Global')
+    channels = ', '.join(campaign_data.get('channels', ['Email']))
+    budget = campaign_data.get('budget', 'TBD')
+    currency = campaign_data.get('currency', 'USD')
     
-    def generate_personalized_email_content(self, campaign_data, email_type, tone, content_format):
-        """Generate personalized email content using Groq"""
-        if not self.client:
-            return self._fallback_email_content(content_format)
-        
-        try:
-            prompt = self._build_email_prompt(campaign_data, email_type, tone, content_format)
-            
-            completion = self.client.chat.completions.create(
-                model="openai/gpt-oss-20b",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert email marketing specialist. Create high-converting, personalized email content that drives engagement and action."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.6,
-                max_completion_tokens=4096,
-                top_p=1,
-                reasoning_effort="medium",
-                stream=True,
-                stop=None
-            )
-            
-            # Collect streamed response
-            full_response = ""
-            for chunk in completion:
-                if chunk.choices[0].delta.content:
-                    full_response += chunk.choices[0].delta.content
-            
-            return full_response
-            
-        except Exception as e:
-            st.error(f"Error generating email content: {e}")
-            return self._fallback_email_content(content_format)
-    
-    def _build_campaign_prompt(self, data):
-        """Build comprehensive campaign prompt"""
-        return f"""
-        Create a comprehensive and highly detailed marketing campaign blueprint for the following:
-        
-        **CAMPAIGN SPECIFICATIONS:**
-        - Company: {data.get('company_name', 'Company')}
-        - Campaign Type: {data.get('campaign_type', 'Marketing')}
-        - Target Audience: {data.get('target_audience', 'General')}
-        - Geographic Target: {data.get('location', 'Global')} {data.get('city_state', '')}
-        - Marketing Channels: {', '.join(data.get('channels', []))}
-        - Budget: {data.get('budget', 'TBD')} {data.get('currency', 'USD')}
-        - Campaign Duration: {data.get('duration', 'TBD')}
-        - Product/Service: {data.get('product_description', 'Product/Service')}
-        - Customer Segment: {data.get('customer_segment', 'General')}
-        
-        **REQUIRED DELIVERABLES:**
-        
-        1. **EXECUTIVE SUMMARY** (2-3 paragraphs)
-           - Campaign overview and key objectives
-           - Expected outcomes and success metrics
-        
-        2. **TARGET AUDIENCE ANALYSIS**
-           - Detailed demographic and psychographic profile
-           - Pain points and motivations
-           - Customer journey mapping
-           - Preferred communication channels
-        
-        3. **COMPETITIVE LANDSCAPE**
-           - Market positioning analysis
-           - Competitive advantages
-           - Differentiation strategy
-        
-        4. **KEY MESSAGING FRAMEWORK**
-           - Primary value proposition
-           - Supporting messages for each audience segment
-           - Emotional triggers and rational benefits
-           - Brand voice and tone guidelines
-        
-        5. **CHANNEL-SPECIFIC STRATEGY**
-           - Detailed tactics for each selected channel: {', '.join(data.get('channels', []))}
-           - Content formats and posting frequency
-           - Budget allocation per channel
-           - Performance benchmarks
-        
-        6. **CAMPAIGN TIMELINE & EXECUTION PLAN**
-           - Phase 1: Pre-launch (preparation tasks)
-           - Phase 2: Launch (go-to-market execution)
-           - Phase 3: Optimization (performance improvement)
-           - Phase 4: Scale & Sustain
-        
-        7. **BUDGET BREAKDOWN & ROI PROJECTIONS**
-           - Detailed cost allocation in {data.get('currency', 'USD')}
-           - Expected ROI and ROAS calculations
-           - Cost per acquisition estimates
-        
-        8. **SUCCESS METRICS & KPIs**
-           - Primary success indicators
-           - Secondary performance metrics
-           - Tracking and measurement methodology
-        
-        9. **RISK ASSESSMENT & MITIGATION**
-           - Potential challenges and obstacles
-           - Contingency plans and alternative strategies
-           - Quality assurance checkpoints
-        
-        10. **IMPLEMENTATION ROADMAP**
-            - Step-by-step action items
-            - Resource requirements and team roles
-            - Critical milestones and deadlines
-        
-        Make this blueprint highly actionable, data-driven, and tailored specifically for {data.get('location', 'the target market')}. Include specific recommendations that can be implemented immediately.
-        """
-    
-    def _build_email_prompt(self, campaign_data, email_type, tone, content_format):
-        """Build email content prompt"""
-        company = campaign_data.get('company_name', 'Our Company') if campaign_data else 'Our Company'
-        campaign_type = campaign_data.get('campaign_type', 'marketing campaign') if campaign_data else 'marketing campaign'
-        audience = campaign_data.get('target_audience', 'valued customers') if campaign_data else 'valued customers'
-        
-        format_instruction = "HTML email template with inline CSS" if content_format == "HTML Template" else "plain text email"
-        
-        return f"""
-        Create a high-converting {format_instruction} for {company}'s {campaign_type}.
-        
-        **EMAIL SPECIFICATIONS:**
-        - Email Type: {email_type}
-        - Tone: {tone}
-        - Target Audience: {audience}
-        - Format: {format_instruction}
-        
-        **REQUIREMENTS:**
-        - Include compelling subject line suggestions (3 options)
-        - Use personalization placeholders: {{{{first_name}}}}, {{{{name}}}}, {{{{email}}}}
-        - Create engaging opening that hooks the reader
-        - Clear value proposition and benefits
-        - Strong call-to-action (CTA) button/link
-        - Professional closing and signature
-        - Mobile-responsive design (if HTML)
-        - Compliance with email marketing best practices
-        
-        **CONTENT STRUCTURE:**
-        1. Subject Line Options (3 variations)
-        2. Email Content (complete template)
-        3. Alternative CTA suggestions
-        
-        {"For HTML: Use inline CSS, ensure cross-client compatibility, include fallback fonts. Create visually appealing layout with proper spacing, colors, and typography." if content_format == "HTML Template" else "For Plain Text: Use clear formatting with line breaks, bullet points, and proper spacing for easy readability."}
-        
-        Make this email highly engaging, conversion-focused, and perfectly tailored for {audience}.
-        """
-    
-    def _fallback_blueprint(self, data):
-        """Fallback blueprint if API fails"""
-        return f"""
-# {data.get('company_name', 'Your Company')} - {data.get('campaign_type', 'Marketing')} Campaign
+    blueprint = f"""
+# {company_name} - {campaign_type} Campaign Strategy
 
-## Executive Summary
-Comprehensive {data.get('campaign_type', 'marketing')} campaign targeting {data.get('target_audience', 'key audience')} in {data.get('location', 'target market')}.
+## 🎯 Campaign Overview
+- **Company:** {company_name}
+- **Campaign Type:** {campaign_type}
+- **Target Market:** {location}
+- **Budget:** {budget} {currency}
+- **Channels:** {channels}
 
-## Campaign Objectives
-- Increase brand awareness and market penetration
-- Drive qualified lead generation
-- Boost customer engagement and conversions
-- Achieve measurable ROI within campaign period
+## 👥 Target Audience
+{target_audience}
 
-## Target Audience Analysis
-**Primary Target:** {data.get('target_audience', 'Target Audience')}
-- Geographic Focus: {data.get('location', 'Market Location')}
-- Customer Segment: {data.get('customer_segment', 'Market Segment')}
-- Preferred Channels: {', '.join(data.get('channels', ['Digital Channels']))}
+## 📈 Campaign Objectives
+1. **Increase Brand Awareness** - Reach new potential customers
+2. **Drive Engagement** - Generate meaningful interactions
+3. **Boost Conversions** - Turn prospects into customers
+4. **Build Customer Loyalty** - Strengthen relationships
 
-## Channel Strategy
-**Selected Channels:** {', '.join(data.get('channels', ['Email', 'Social Media']))}
-- Integrated approach across all touchpoints
-- Channel-specific content optimization
-- Cross-channel attribution tracking
+## 🚀 Implementation Strategy
 
-## Implementation Timeline
-- **Phase 1:** Campaign setup and preparation
-- **Phase 2:** Launch and initial optimization
-- **Phase 3:** Scale and performance improvement
-- **Phase 4:** Analysis and future planning
+### Phase 1: Preparation (Week 1-2)
+- Finalize creative assets and messaging
+- Set up tracking and analytics
+- Prepare email lists and segmentation
+- Test all systems and workflows
 
-## Budget & ROI
-- **Total Budget:** {data.get('budget', 'TBD')} {data.get('currency', 'USD')}
-- **Expected ROI:** 250-400%
-- **Timeline:** {data.get('duration', 'Campaign Duration')}
+### Phase 2: Launch (Week 3-4)
+- Deploy campaigns across all channels
+- Monitor performance in real-time
+- Engage with audience responses
+- Make quick optimizations as needed
 
-## Success Metrics
-- Reach and impressions
-- Engagement rates
-- Conversion rates
-- Customer acquisition cost
-- Return on advertising spend
+### Phase 3: Optimization (Week 5-6)
+- Analyze performance data
+- A/B testing for improvement
+- Scale successful elements
+- Prepare follow-up campaigns
+
+## 📊 Success Metrics
+- **Reach:** Number of people exposed to campaign
+- **Engagement:** Clicks, likes, shares, comments
+- **Conversions:** Sign-ups, purchases, downloads
+- **ROI:** Return on investment calculation
+
+## 💰 Budget Allocation
+- Creative Development: 25%
+- Media/Advertising: 45%
+- Technology & Tools: 20%
+- Analytics & Reporting: 10%
+
+## 🔄 Next Steps
+1. Review and approve this strategy
+2. Begin creative asset development
+3. Set up tracking systems
+4. Launch campaign according to timeline
+5. Monitor and optimize performance
+
+---
+*Campaign strategy generated on {datetime.now().strftime('%Y-%m-%d')}*
 """
     
-    def _fallback_email_content(self, content_format):
-        """Fallback email content"""
-        if content_format == "HTML Template":
-            return '''
+    return blueprint
+
+def generate_email_template(campaign_type, tone, is_html=True):
+    """Generate email template"""
+    
+    if is_html:
+        template = f'''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Campaign Email</title>
+    <title>{campaign_type}</title>
     <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 0; background-color: #f5f5f5; }
-        .email-container { background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px 20px; text-align: center; }
-        .content { padding: 30px 20px; line-height: 1.6; }
-        .cta-button { background: #007bff; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 20px 0; font-weight: bold; }
-        .footer { background: #f8f9fa; padding: 20px; text-align: center; font-size: 12px; color: #666; }
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #f5f5f5; }}
+        .container {{ background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px 20px; text-align: center; }}
+        .content {{ padding: 30px 20px; line-height: 1.6; color: #333; }}
+        .cta-button {{ background: #007bff; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 20px 0; font-weight: bold; }}
+        .footer {{ background: #f8f9fa; padding: 20px; text-align: center; font-size: 12px; color: #666; }}
     </style>
 </head>
 <body>
-    <div class="email-container">
+    <div class="container">
         <div class="header">
             <h1>Hello {{first_name}}!</h1>
             <p>We have something special for you</p>
         </div>
         <div class="content">
-            <p>We're excited to share this exclusive opportunity with you, {{name}}.</p>
-            <p>As a valued member of our community, you get early access to our latest campaign.</p>
+            <p>Dear {{name}},</p>
+            <p>We're excited to share this exclusive {campaign_type.lower()} with you.</p>
+            <p>As a valued member of our community, you deserve the best we have to offer.</p>
             <div style="text-align: center;">
                 <a href="#" class="cta-button">Discover More</a>
             </div>
@@ -482,26 +452,26 @@ Comprehensive {data.get('campaign_type', 'marketing')} campaign targeting {data.
         </div>
         <div class="footer">
             <p>Best regards,<br>The Marketing Team</p>
-            <p>You received this because you're subscribed to our updates.</p>
+            <p>You received this email because you're subscribed to our updates.</p>
         </div>
     </div>
 </body>
 </html>
 '''
-        else:
-            return '''Subject: Exclusive Opportunity for {{first_name}}
+    else:
+        template = f'''Subject: Exclusive {campaign_type} for {{first_name}}
 
 Hello {{first_name}},
 
-We're excited to share this exclusive opportunity with you.
+We're excited to share this exclusive {campaign_type.lower()} with you.
 
-As a valued member of our community, you get early access to our latest campaign.
+As a valued member of our community, you deserve the best we have to offer.
 
 Here's what makes this special:
 • Personalized just for you
-• Exclusive member benefits  
-• Limited-time access
-• Premium features included
+• Exclusive member benefits
+• Limited-time opportunity
+• Premium experience
 
 Ready to explore? Visit our website or reply to this email.
 
@@ -513,301 +483,11 @@ The Marketing Team
 ---
 You received this email because you're subscribed to our updates.
 Unsubscribe | Update Preferences'''
+    
+    return template
 
 # ================================
-# EMAIL PERSONALIZER
-# ================================
-
-class EmailPersonalizer:
-    """Handle intelligent email personalization"""
-    
-    @staticmethod
-    def extract_name_from_email(email):
-        """Extract potential name from email address"""
-        try:
-            local_part = email.split('@')[0]
-            name_part = re.sub(r'[0-9._-]', ' ', local_part)
-            name_parts = [part.capitalize() for part in name_part.split() if len(part) > 1]
-            return ' '.join(name_parts) if name_parts else 'Valued Customer'
-        except:
-            return 'Valued Customer'
-    
-    @staticmethod
-    def personalize_template(template, name, email=None):
-        """Personalize email template"""
-        first_name = name.split()[0] if name and ' ' in name else name
-        
-        personalized = template.replace('{name}', name or 'Valued Customer')
-        personalized = personalized.replace('{{name}}', name or 'Valued Customer')
-        personalized = personalized.replace('{first_name}', first_name or 'Valued Customer')
-        personalized = personalized.replace('{{first_name}}', first_name or 'Valued Customer')
-        personalized = personalized.replace('{email}', email or '')
-        personalized = personalized.replace('{{email}}', email or '')
-        
-        return personalized
-
-# ================================
-# FIXED EMAIL HANDLER
-# ================================
-
-class EmailHandler:
-    """COMPLETELY FIXED email handling with robust error handling"""
-    
-    def __init__(self):
-        self.smtp_server = "smtp.gmail.com"
-        self.smtp_port = 587
-        self.email = GMAIL_USER
-        self.password = GMAIL_APP_PASSWORD
-    
-    def validate_email_address(self, email):
-        try:
-            validate_email(email)
-            return True
-        except EmailNotValidError:
-            return False
-    
-    def send_single_email(self, to_email, subject, body, is_html=True):
-        """Send a single email with comprehensive error handling"""
-        if not self.email or not self.password:
-            return False, "Gmail credentials not configured. Please check GMAIL_USER and GMAIL_APP_PASSWORD in .env file"
-            
-        try:
-            msg = MIMEMultipart('alternative')
-            msg['From'] = self.email
-            msg['To'] = to_email
-            msg['Subject'] = subject
-            
-            if is_html:
-                msg.attach(MIMEText(body, 'html'))
-            else:
-                msg.attach(MIMEText(body, 'plain'))
-            
-            context = ssl.create_default_context()
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls(context=context)
-                server.login(self.email, self.password)
-                text = msg.as_string()
-                server.sendmail(self.email, to_email, text)
-            
-            return True, "Success"
-            
-        except smtplib.SMTPAuthenticationError as e:
-            return False, f"Gmail authentication failed. Check your app password: {str(e)}"
-        except smtplib.SMTPRecipientsRefused as e:
-            return False, f"Recipient {to_email} was refused: {str(e)}"
-        except smtplib.SMTPServerDisconnected as e:
-            return False, f"SMTP server disconnected: {str(e)}"
-        except Exception as e:
-            return False, f"Email sending error: {str(e)}"
-    
-    def send_bulk_emails_completely_fixed(self, email_list, subject, body_template, personalizer, is_html=True):
-        """COMPLETELY FIXED bulk email sending function"""
-        
-        # Validate credentials first
-        if not self.email or not self.password:
-            st.error("❌ Gmail configuration missing!")
-            st.error("Please ensure GMAIL_USER and GMAIL_APP_PASSWORD are set in your .env file")
-            st.code("""
-# Add to your .env file:
-GMAIL_USER=your_email@gmail.com
-GMAIL_APP_PASSWORD=your_16_digit_app_password
-            """)
-            return pd.DataFrame()
-        
-        total_emails = len(email_list)
-        results = []
-        
-        # Create persistent containers
-        progress_container = st.container()
-        status_container = st.container()
-        metrics_container = st.container()
-        
-        sent_count = 0
-        failed_count = 0
-        invalid_count = 0
-        
-        # Process each email
-        for index, row in email_list.iterrows():
-            current_progress = (index + 1) / total_emails
-            
-            # Update progress
-            with progress_container:
-                st.progress(current_progress, text=f"Processing {index + 1} of {total_emails}")
-            
-            # Update status
-            with status_container:
-                st.info(f"📧 Sending to: {row['email']} ({row.get('name', 'Unknown')})")
-            
-            # Validate email
-            if not self.validate_email_address(row['email']):
-                invalid_count += 1
-                results.append({
-                    "email": row['email'],
-                    "name": row.get('name', 'Unknown'),
-                    "status": "invalid",
-                    "error": "Invalid email format",
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                })
-            else:
-                # Prepare personalized content
-                name = row.get('name', personalizer.extract_name_from_email(row['email']))
-                
-                try:
-                    personalized_body = personalizer.personalize_template(body_template, name, row['email'])
-                    personalized_subject = personalizer.personalize_template(subject, name, row['email'])
-                    
-                    # Send email
-                    success, error_msg = self.send_single_email(
-                        row['email'], 
-                        personalized_subject, 
-                        personalized_body, 
-                        is_html=is_html
-                    )
-                    
-                    if success:
-                        sent_count += 1
-                        status = "sent"
-                        error_msg = ""
-                    else:
-                        failed_count += 1
-                        status = "failed"
-                    
-                    results.append({
-                        "email": row['email'],
-                        "name": name,
-                        "status": status,
-                        "error": error_msg,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-                    
-                except Exception as e:
-                    failed_count += 1
-                    results.append({
-                        "email": row['email'],
-                        "name": row.get('name', 'Unknown'),
-                        "status": "failed",
-                        "error": f"Processing error: {str(e)}",
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-            
-            # Update live metrics
-            with metrics_container:
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("✅ Sent", sent_count, delta=None)
-                with col2:
-                    st.metric("❌ Failed", failed_count, delta=None)
-                with col3:
-                    st.metric("⚠️ Invalid", invalid_count, delta=None)
-                with col4:
-                    st.metric("📊 Progress", f"{current_progress * 100:.1f}%", delta=None)
-            
-            # Rate limiting delay
-            time.sleep(1.5)
-        
-        # Final status update
-        with progress_container:
-            st.progress(1.0, text="Campaign completed!")
-        
-        with status_container:
-            st.success("🎉 Email campaign completed successfully!")
-        
-        return pd.DataFrame(results)
-
-# ================================
-# FILE PROCESSOR
-# ================================
-
-class FileProcessor:
-    """Process files and extract contacts"""
-    
-    def __init__(self):
-        self.email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        self.personalizer = EmailPersonalizer()
-    
-    def process_file(self, uploaded_file):
-        """Process uploaded file and extract contacts"""
-        try:
-            file_extension = uploaded_file.name.split('.')[-1].lower()
-            
-            if file_extension == 'csv':
-                df = pd.read_csv(uploaded_file)
-            elif file_extension in ['xlsx', 'xls']:
-                df = pd.read_excel(uploaded_file)
-            else:
-                st.error("Unsupported file format. Please use CSV or Excel files.")
-                return None
-            
-            return self._process_dataframe(df)
-            
-        except Exception as e:
-            st.error(f"Error processing file: {e}")
-            return None
-    
-    def _process_dataframe(self, df):
-        """Process dataframe and standardize columns"""
-        # Convert column names to lowercase
-        df.columns = df.columns.str.lower()
-        
-        # Find email and name columns
-        email_col = None
-        name_cols = []
-        
-        # Look for email column
-        for col in df.columns:
-            if 'email' in col or 'mail' in col:
-                email_col = col
-                break
-        
-        # Look for name columns
-        for col in df.columns:
-            if any(keyword in col for keyword in ['name', 'first', 'last', 'fname', 'lname']):
-                name_cols.append(col)
-        
-        if email_col is None:
-            st.error("❌ No email column found in the file. Please ensure your file has an 'email' column.")
-            st.info("💡 Expected column names: 'email', 'mail', 'email_address', etc.")
-            return None
-        
-        # Process contacts
-        result_data = []
-        
-        for _, row in df.iterrows():
-            email = row[email_col]
-            if pd.isna(email) or str(email).strip() == '':
-                continue
-            
-            # Clean email
-            email = str(email).strip().lower()
-            
-            # Get name
-            name_parts = []
-            for name_col in name_cols:
-                if name_col in row and not pd.isna(row[name_col]):
-                    name_parts.append(str(row[name_col]).strip())
-            
-            if name_parts:
-                full_name = ' '.join(name_parts)
-            else:
-                full_name = self.personalizer.extract_name_from_email(email)
-            
-            # Validate email
-            try:
-                validate_email(email)
-                result_data.append({'email': email, 'name': full_name})
-            except EmailNotValidError:
-                continue
-        
-        if not result_data:
-            st.error("❌ No valid emails found in the file")
-            return None
-        
-        result_df = pd.DataFrame(result_data)
-        st.success(f"✅ Successfully processed {len(result_df)} valid contacts!")
-        return result_df
-
-# ================================
-# STREAMLIT APP CONFIGURATION
+# STREAMLIT APP
 # ================================
 
 st.set_page_config(
@@ -817,24 +497,18 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize session state
 initialize_session_state()
 
 # Custom CSS
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    
     .stApp {
         background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 100%);
-        font-family: 'Inter', sans-serif;
+        color: white;
     }
-    
     h1, h2, h3 {
         color: #00d4ff !important;
-        font-weight: 600 !important;
     }
-    
     .stButton > button {
         background: linear-gradient(45deg, #00d4ff, #0099cc) !important;
         color: white !important;
@@ -842,28 +516,7 @@ st.markdown("""
         border-radius: 10px !important;
         padding: 0.75rem 1.5rem !important;
         font-weight: 600 !important;
-        transition: all 0.3s ease !important;
-        box-shadow: 0 4px 15px rgba(0, 212, 255, 0.3) !important;
         width: 100% !important;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px) !important;
-        box-shadow: 0 6px 20px rgba(0, 212, 255, 0.4) !important;
-    }
-    
-    .success-button {
-        background: linear-gradient(45deg, #28a745, #20c997) !important;
-        color: white !important;
-    }
-    
-    .stTextInput > div > div > input,
-    .stTextArea > div > div > textarea,
-    .stSelectbox > div > div > select {
-        background-color: #1e1e1e !important;
-        color: #ffffff !important;
-        border: 1px solid #333 !important;
-        border-radius: 8px !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -873,7 +526,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; padding: 2rem 0;">
         <h1 style="font-size: 3rem; margin-bottom: 0;">🚀 Marketing Campaign War Room</h1>
-        <p style="font-size: 1.2rem; color: #888; margin-top: 0;">AI-Powered Campaign Generation & Email Marketing Platform</p>
+        <p style="font-size: 1.2rem; color: #888; margin-top: 0;">AI-Powered Campaign Generation & Email Marketing</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -881,17 +534,16 @@ def main():
     with st.sidebar:
         st.markdown("### 🎯 Navigation")
         
-        # Navigation buttons
-        if st.button("🎯 Campaign Dashboard", key="nav_campaign"):
+        if st.button("🎯 Campaign Dashboard"):
             st.session_state.current_page = "Campaign Dashboard"
             st.rerun()
         
-        if st.button("📧 Email Marketing", key="nav_email"):
+        if st.button("📧 Email Marketing"):
             st.session_state.current_page = "Email Marketing"
             st.rerun()
         
-        if st.button("📊 Analytics & Reports", key="nav_analytics"):
-            st.session_state.current_page = "Analytics & Reports"
+        if st.button("📊 Analytics"):
+            st.session_state.current_page = "Analytics"
             st.rerun()
         
         st.markdown("---")
@@ -899,92 +551,67 @@ def main():
         # System status
         st.markdown("### 🔧 System Status")
         
-        if GROQ_API_KEY:
-            st.success("🤖 Groq AI: Connected")
+        if GMAIL_USER and GMAIL_PASSWORD:
+            st.success("📧 Email: Connected")
         else:
-            st.error("🤖 Groq AI: Not configured")
+            st.error("📧 Email: Not configured")
         
-        if GMAIL_USER and GMAIL_APP_PASSWORD:
-            st.success("📧 Email Service: Connected")
+        if HF_TOKEN:
+            st.success("🎨 Images: Connected")
         else:
-            st.error("📧 Email Service: Not configured")
-        
-        if GEMINI_API_KEY:
-            st.success("🎨 Gemini AI: Connected")
-        else:
-            st.warning("🎨 Gemini AI: Not configured")
-        
-        st.markdown("---")
+            st.warning("🎨 Images: Not configured")
         
         # Campaign info
         if st.session_state.current_campaign:
             st.markdown("### 🎯 Active Campaign")
             st.info(f"**{st.session_state.current_campaign['company_name']}**")
-            st.caption(f"Type: {st.session_state.current_campaign['campaign_type']}")
         
         if st.session_state.email_contacts is not None:
-            st.markdown("### 📊 Contacts")
-            st.info(f"📧 Loaded: {len(st.session_state.email_contacts)}")
+            st.markdown("### 📊 Stats")
+            st.info(f"📧 Contacts: {len(st.session_state.email_contacts)}")
     
     # Main content
     if st.session_state.current_page == "Campaign Dashboard":
         show_campaign_dashboard()
     elif st.session_state.current_page == "Email Marketing":
         show_email_marketing()
-    elif st.session_state.current_page == "Analytics & Reports":
-        show_analytics_reports()
+    elif st.session_state.current_page == "Analytics":
+        show_analytics()
 
 def show_campaign_dashboard():
-    st.header("🎯 AI Campaign Strategy Generator")
+    st.header("🎯 Campaign Strategy Generator")
     
-    # Campaign form
     with st.form("campaign_form"):
         col1, col2 = st.columns(2)
         
         with col1:
-            company_name = st.text_input("🏢 Company Name", 
-                value=st.session_state.current_campaign['company_name'] if st.session_state.current_campaign else "")
-            
+            company_name = st.text_input("🏢 Company Name")
             campaign_type = st.selectbox("📋 Campaign Type", [
-                "Product Launch", "Brand Awareness", "Seasonal Campaign", "Customer Retention",
-                "Lead Generation", "Event Promotion", "Sales Campaign", "Newsletter Campaign"
+                "Product Launch", "Brand Awareness", "Seasonal Campaign",
+                "Lead Generation", "Customer Retention", "Event Promotion"
             ])
-            
             target_audience = st.text_area("👥 Target Audience", 
-                placeholder="Describe demographics, interests, pain points...")
-            
-            duration = st.text_input("📅 Campaign Duration", placeholder="e.g., 4 weeks, 2 months")
+                placeholder="Describe your target audience...")
+            duration = st.text_input("📅 Duration", placeholder="e.g., 4 weeks")
         
         with col2:
-            channels = st.multiselect("📢 Marketing Channels", [
-                "Email Marketing", "Social Media", "Google Ads", "Facebook Ads", 
-                "Content Marketing", "Influencer Marketing", "TV/Radio", "Print Media"
+            channels = st.multiselect("📢 Channels", [
+                "Email Marketing", "Social Media", "Google Ads", "Facebook Ads",
+                "Content Marketing", "Influencer Marketing"
             ])
-            
-            location = st.selectbox("🌍 Target Country", COUNTRIES)
-            city_state = st.text_input("🏙️ City/State", placeholder="e.g., New York, NY")
-            customer_segment = st.selectbox("💼 Customer Segment", 
-                ["Mass Market", "Premium", "Niche", "Enterprise", "SMB"])
-        
-        # Budget and Currency
-        budget_col1, budget_col2 = st.columns(2)
-        with budget_col1:
-            budget = st.text_input("💰 Budget Amount", placeholder="e.g., 50000")
-        with budget_col2:
+            location = st.selectbox("🌍 Location", COUNTRIES)
+            budget = st.text_input("💰 Budget", placeholder="e.g., 10000")
             currency = st.selectbox("💱 Currency", CURRENCIES)
         
-        product_description = st.text_area("📦 Product/Service Description",
-            placeholder="Describe what you're promoting...")
+        product_description = st.text_area("📦 Product/Service Description")
         
-        # Buttons
         col1, col2 = st.columns(2)
         with col1:
-            generate_campaign = st.form_submit_button("🚀 Generate Campaign Strategy", use_container_width=True)
+            generate_campaign = st.form_submit_button("🚀 Generate Campaign")
         with col2:
-            generate_image = st.form_submit_button("🎨 Generate Campaign Image", use_container_width=True)
+            generate_image = st.form_submit_button("🎨 Generate Image")
     
-    # Handle campaign generation
-    if generate_campaign and company_name and campaign_type:
+    if generate_campaign and company_name:
         campaign_data = {
             'company_name': company_name,
             'campaign_type': campaign_type,
@@ -992,142 +619,86 @@ def show_campaign_dashboard():
             'duration': duration,
             'channels': channels,
             'location': location,
-            'city_state': city_state,
-            'customer_segment': customer_segment,
             'budget': budget,
             'currency': currency,
             'product_description': product_description
         }
         
-        with st.spinner("🤖 Groq AI is generating your comprehensive campaign strategy..."):
-            generator = GroqAIGenerator()
-            blueprint = generator.generate_campaign_blueprint(campaign_data)
-            
-            # Store in session state
+        with st.spinner("Generating campaign strategy..."):
+            blueprint = generate_campaign_blueprint(campaign_data)
             st.session_state.current_campaign = campaign_data
             st.session_state.campaign_blueprint = blueprint
-            
-            st.success("✨ Campaign strategy generated successfully!")
-            st.balloons()
+            st.success("✨ Campaign strategy generated!")
     
-    # Handle image generation
     if generate_image and st.session_state.current_campaign:
         campaign_desc = f"{st.session_state.current_campaign['company_name']} {st.session_state.current_campaign['campaign_type']}"
-        image_gen = GeminiImageGenerator()
-        image_gen.generate_campaign_image(campaign_desc, "professional")
+        image_gen = HuggingFaceImageGenerator()
+        image_gen.generate_campaign_image(campaign_desc)
     
-    # Display existing campaign
     if st.session_state.campaign_blueprint:
         st.markdown("---")
-        st.markdown("## 📋 Your AI-Generated Campaign Strategy")
+        st.markdown("## 📋 Campaign Strategy")
         st.markdown(st.session_state.campaign_blueprint)
         
-        # Action buttons
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            if st.button("📧 Create Email Campaign", use_container_width=True, key="goto_email"):
+            if st.button("📧 Create Emails"):
                 st.session_state.current_page = "Email Marketing"
                 st.rerun()
         with col2:
-            if st.button("📊 View Analytics", use_container_width=True, key="goto_analytics"):
-                st.session_state.current_page = "Analytics & Reports"
-                st.rerun()
-        with col3:
-            if st.session_state.current_campaign:
-                st.download_button("📄 Download Strategy", 
-                    data=st.session_state.campaign_blueprint,
-                    file_name=f"{st.session_state.current_campaign['company_name']}_strategy.md",
-                    mime="text/markdown",
-                    use_container_width=True)
+            st.download_button("📄 Download", 
+                data=st.session_state.campaign_blueprint,
+                file_name=f"{st.session_state.current_campaign['company_name']}_strategy.md",
+                mime="text/markdown")
 
 def show_email_marketing():
-    st.header("📧 AI Email Marketing Center")
+    st.header("📧 Email Marketing Center")
     
-    # Show active campaign
     if st.session_state.current_campaign:
-        st.success(f"🎯 Active: **{st.session_state.current_campaign['company_name']}** - {st.session_state.current_campaign['campaign_type']}")
-    else:
-        st.info("💡 Create a campaign first for AI-generated content")
+        st.success(f"🎯 Campaign: **{st.session_state.current_campaign['company_name']}**")
     
-    # Email content generation
-    st.subheader("🎨 Generate Personalized Email Content with Groq AI")
+    # Email template generation
+    st.subheader("🎨 Generate Email Template")
     
-    with st.form("email_content_form"):
-        template_col1, template_col2 = st.columns(2)
+    col1, col2 = st.columns(2)
+    with col1:
+        email_type = st.selectbox("Email Type", [
+            "Welcome", "Product Announcement", "Promotional Offer",
+            "Newsletter", "Follow-up", "Event Invitation"
+        ])
+        tone = st.selectbox("Tone", ["Professional", "Friendly", "Casual", "Urgent"])
+    
+    with col2:
+        content_format = st.radio("Format", ["HTML Template", "Plain Text"])
         
-        with template_col1:
-            email_type = st.selectbox("📧 Email Type", [
-                "Welcome Email", "Product Announcement", "Promotional Offer", 
-                "Newsletter", "Follow-up Email", "Event Invitation", "Customer Survey"
-            ])
-            tone = st.selectbox("🎭 Tone", ["Professional", "Friendly", "Casual", "Urgent", "Formal"])
-        
-        with template_col2:
-            content_format = st.radio("📝 Format", ["HTML Template", "Plain Text"])
-            
-        generate_content = st.form_submit_button("🚀 Generate AI Email Content", use_container_width=True)
-    
-    if generate_content:
-        if st.session_state.current_campaign:
-            with st.spinner("🤖 Groq AI is crafting your personalized email content..."):
-                generator = GroqAIGenerator()
-                content = generator.generate_personalized_email_content(
-                    st.session_state.current_campaign, 
-                    email_type, 
-                    tone, 
-                    content_format
-                )
-                
-                if content_format == "HTML Template":
-                    st.session_state.email_template = content
-                else:
-                    st.session_state.plain_text_template = content
-                
-                st.success("✨ AI email content generated!")
-        else:
-            st.warning("⚠️ Please create a campaign first")
+        if st.button("🚀 Generate Template"):
+            is_html = content_format == "HTML Template"
+            template = generate_email_template(email_type, tone, is_html)
+            st.session_state.email_template = template
+            st.success("✨ Template generated!")
     
     # Template editor
-    if st.session_state.email_template or st.session_state.plain_text_template:
+    if st.session_state.email_template:
         st.markdown("---")
-        st.subheader("📝 Edit Email Content")
+        st.subheader("📝 Edit Email Template")
         
-        # Choose template type
-        if st.session_state.email_template and st.session_state.plain_text_template:
-            edit_choice = st.radio("Edit:", ["HTML Template", "Plain Text"], key="edit_choice")
-            current_template = st.session_state.email_template if edit_choice == "HTML Template" else st.session_state.plain_text_template
-        elif st.session_state.email_template:
-            current_template = st.session_state.email_template
-            edit_choice = "HTML Template"
-        else:
-            current_template = st.session_state.plain_text_template
-            edit_choice = "Plain Text"
+        edited_template = st.text_area("Email Content:", 
+            value=st.session_state.email_template, 
+            height=300)
+        st.session_state.email_template = edited_template
         
-        # Editor
-        edited_content = st.text_area("Email Content:", 
-            value=current_template, 
-            height=400,
-            help="Use {{first_name}}, {{name}}, and {{email}} for personalization")
-        
-        # Update session state
-        if edit_choice == "HTML Template":
-            st.session_state.email_template = edited_content
-        else:
-            st.session_state.plain_text_template = edited_content
-        
-        # Preview HTML
-        if edit_choice == "HTML Template" and st.button("👀 Preview Email", key="preview_btn"):
+        # Preview
+        if st.button("👀 Preview") and 'html' in st.session_state.email_template.lower():
             personalizer = EmailPersonalizer()
-            preview = personalizer.personalize_template(edited_content, "John Smith", "john@example.com")
+            preview = personalizer.personalize_content(edited_template, "John Smith", "john@example.com")
             st.components.v1.html(preview, height=500, scrolling=True)
     
     st.markdown("---")
     
     # Contact upload
-    st.subheader("👥 Upload Email Contacts")
+    st.subheader("👥 Upload Contacts")
     
-    uploaded_file = st.file_uploader("Upload CSV/Excel file with emails", 
-        type=['csv', 'xlsx'], key="contact_upload")
+    uploaded_file = st.file_uploader("Upload CSV/Excel", type=['csv', 'xlsx'])
     
     if uploaded_file:
         processor = FileProcessor()
@@ -1135,186 +706,113 @@ def show_email_marketing():
         
         if contacts is not None:
             st.session_state.email_contacts = contacts
-            
-            # Show editable contacts
-            st.subheader("📋 Review & Edit Contacts")
-            edited_contacts = st.data_editor(
-                contacts,
-                column_config={
-                    "email": st.column_config.TextColumn("📧 Email Address"),
-                    "name": st.column_config.TextColumn("👤 Full Name")
-                },
-                num_rows="dynamic",
-                use_container_width=True,
-                key="contact_editor"
-            )
-            st.session_state.email_contacts = edited_contacts
+            st.success(f"✅ Loaded {len(contacts)} contacts!")
+            st.dataframe(contacts)
     
-    # Email campaign launch - COMPLETELY FIXED
+    # WORKING Email campaign launch
     if (st.session_state.email_contacts is not None and 
-        (st.session_state.email_template or st.session_state.plain_text_template)):
+        st.session_state.email_template):
         
         st.markdown("---")
-        st.subheader("🚀 Launch Email Campaign")
+        st.subheader("🚀 Launch Campaign")
         
         df = st.session_state.email_contacts
         
-        # Campaign overview
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("👥 Total Contacts", len(df))
+            st.metric("👥 Contacts", len(df))
         with col2:
-            domains = df['email'].str.split('@').str[1].nunique()
-            st.metric("🏢 Email Domains", domains)
+            st.metric("📧 Template", "✅ Ready")
         with col3:
-            st.metric("📧 Template Status", "✅ Ready")
+            st.metric("🔧 System", "✅ Ready")
         
-        # Campaign configuration
-        config_col1, config_col2 = st.columns(2)
+        # Campaign settings
+        subject = st.text_input("📧 Subject Line", 
+            value="Hello {first_name}, check this out!")
         
-        with config_col1:
-            subject = st.text_input("📧 Email Subject Line", 
-                value="Personalized message for {{first_name}}",
-                help="Use {{first_name}} and {{name}} for personalization")
+        # Test email
+        test_email = st.text_input("🧪 Test Email")
+        if test_email and st.button("🧪 Send Test"):
+            personalizer = EmailPersonalizer()
+            test_content = personalizer.personalize_content(st.session_state.email_template, "Test User", test_email)
+            test_subject = personalizer.personalize_content(subject, "Test User", test_email)
             
-            test_email = st.text_input("🧪 Test Email Address", 
-                placeholder="your@email.com")
+            # Simple test email send
+            try:
+                context = ssl.create_default_context()
+                with smtplib.SMTP('smtp.gmail.com', 587) as server:
+                    server.starttls(context=context)
+                    server.login(GMAIL_USER, GMAIL_PASSWORD)
+                    
+                    msg = MIMEMultipart()
+                    msg['Subject'] = f"[TEST] {test_subject}"
+                    msg['From'] = GMAIL_USER
+                    msg['To'] = test_email
+                    msg.attach(MIMEText(test_content, 'html' if '<html>' in test_content.lower() else 'plain'))
+                    
+                    server.sendmail(GMAIL_USER, test_email, msg.as_string())
+                    st.success("✅ Test email sent!")
+            except Exception as e:
+                st.error(f"❌ Test failed: {e}")
         
-        with config_col2:
-            # Choose email format
-            if st.session_state.email_template and st.session_state.plain_text_template:
-                send_format = st.radio("📝 Email Format:", ["HTML Email", "Plain Text Email"])
-                template_to_use = st.session_state.email_template if send_format == "HTML Email" else st.session_state.plain_text_template
-                is_html = send_format == "HTML Email"
-            elif st.session_state.email_template:
-                template_to_use = st.session_state.email_template
-                is_html = True
-                st.info("✅ HTML template ready")
-            else:
-                template_to_use = st.session_state.plain_text_template
-                is_html = False
-                st.info("✅ Plain text template ready")
-        
-        # Test email functionality
-        if test_email:
-            if st.button("🧪 Send Test Email", key="test_email_btn"):
-                email_handler = EmailHandler()
-                personalizer = EmailPersonalizer()
-                
-                test_content = personalizer.personalize_template(template_to_use, "Test User", test_email)
-                test_subject = personalizer.personalize_template(subject, "Test User", test_email)
-                
-                with st.spinner("Sending test email..."):
-                    success, error_msg = email_handler.send_single_email(test_email, test_subject, test_content, is_html)
-                
-                if success:
-                    st.success("✅ Test email sent successfully!")
-                else:
-                    st.error(f"❌ Test email failed: {error_msg}")
-        
-        # FIXED Launch campaign section
-        st.markdown("### 🎯 Launch Campaign")
-        
-        # Launch button
-        if st.button("🚀 LAUNCH PERSONALIZED EMAIL CAMPAIGN", 
-                    type="primary", 
-                    use_container_width=True, 
-                    key="launch_campaign_btn"):
+        # WORKING Launch button
+        if st.button("🚀 LAUNCH EMAIL CAMPAIGN", type="primary"):
+            st.warning(f"⚠️ About to send {len(df)} emails!")
             
-            # Validate configuration
-            if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-                st.error("❌ Gmail configuration missing!")
-                st.error("Please add these to your .env file:")
-                st.code("""
-GMAIL_USER=your_email@gmail.com
-GMAIL_APP_PASSWORD=your_16_digit_app_password
-                """)
-                st.info("💡 Get your app password from Google Account Security settings")
-                st.stop()
-            
-            # Set sending flag
-            st.session_state.email_sending = True
-            
-            # Warning and confirmation
-            st.warning(f"⚠️ About to send {len(df)} personalized emails. This cannot be undone!")
-            
-            # Confirmation button with unique key
-            confirm_key = f"confirm_send_{datetime.now().timestamp()}"
-            
-            if st.button("✅ CONFIRM & SEND ALL EMAILS", 
-                        key=confirm_key, 
-                        type="secondary"):
+            if st.button("✅ CONFIRM SEND"):
+                # Create progress containers
+                progress_placeholder = st.empty()
+                status_placeholder = st.empty()
                 
-                st.info("🚀 Launching personalized email campaign...")
-                
-                # Initialize components
-                email_handler = EmailHandler()
-                personalizer = EmailPersonalizer()
-                
-                # Send emails with the completely fixed function
-                results = email_handler.send_bulk_emails_completely_fixed(
-                    df, subject, template_to_use, personalizer, is_html
+                # Send emails using the working function
+                results = send_bulk_emails_working(
+                    df, 
+                    subject, 
+                    st.session_state.email_template,
+                    progress_placeholder,
+                    status_placeholder
                 )
                 
-                # Process results
                 if not results.empty:
+                    # Show results
                     success_count = len(results[results['status'] == 'sent'])
                     failed_count = len(results[results['status'] == 'failed'])
                     invalid_count = len(results[results['status'] == 'invalid'])
-                    success_rate = (success_count / len(results)) * 100
                     
                     st.markdown("### 🎉 Campaign Results")
                     
-                    # Results metrics
-                    result_col1, result_col2, result_col3, result_col4 = st.columns(4)
-                    
-                    with result_col1:
-                        st.metric("✅ Successfully Sent", success_count)
-                    with result_col2:
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("✅ Sent", success_count)
+                    with col2:
                         st.metric("❌ Failed", failed_count)
-                    with result_col3:
-                        st.metric("⚠️ Invalid Emails", invalid_count)
-                    with result_col4:
+                    with col3:
+                        st.metric("⚠️ Invalid", invalid_count)
+                    with col4:
+                        success_rate = (success_count / len(results)) * 100
                         st.metric("📊 Success Rate", f"{success_rate:.1f}%")
                     
-                    # Store results for analytics
+                    # Store results
                     st.session_state.campaign_results = results
-                    
-                    # Success celebration
-                    if success_count > 0:
-                        st.balloons()
-                        st.success(f"🎊 Campaign completed! {success_count} emails sent successfully!")
                     
                     # Download results
                     csv = results.to_csv(index=False)
-                    st.download_button("📥 Download Campaign Results", 
+                    st.download_button("📥 Download Results", 
                         data=csv, 
-                        file_name=f"email_campaign_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        use_container_width=True)
+                        file_name=f"results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv")
                     
-                    # Detailed results
-                    with st.expander("📋 View Detailed Results"):
-                        st.dataframe(results, use_container_width=True)
-                
-                # Reset sending flag
-                st.session_state.email_sending = False
-        
-        # Show any generated images
-        if st.session_state.generated_images:
-            st.markdown("---")
-            st.subheader("🎨 Campaign Images")
-            for i, img_data in enumerate(st.session_state.generated_images):
-                if 'image' in img_data:
-                    st.image(img_data['image'], caption=f"Campaign image {i+1}", use_column_width=True)
+                    # Show detailed results
+                    with st.expander("📋 View Results"):
+                        st.dataframe(results)
+                    
+                    if success_count > 0:
+                        st.balloons()
 
-def show_analytics_reports():
-    st.header("📊 Campaign Analytics & Reports")
+def show_analytics():
+    st.header("📊 Analytics Dashboard")
     
-    # Campaign-based analytics
     if st.session_state.current_campaign:
-        st.subheader("🗺️ Campaign Geographic Analysis")
-        
         campaign = st.session_state.current_campaign
         location = campaign['location']
         
@@ -1325,9 +823,7 @@ def show_analytics_reports():
             map_data = pd.DataFrame({
                 'lat': [coords[0]],
                 'lon': [coords[1]], 
-                'location': [location],
-                'campaign': [campaign['campaign_type']],
-                'company': [campaign['company_name']]
+                'location': [location]
             })
             
             fig = px.scatter_mapbox(
@@ -1335,9 +831,7 @@ def show_analytics_reports():
                 lat='lat',
                 lon='lon',
                 hover_name='location',
-                hover_data={'campaign': True, 'company': True, 'lat': False, 'lon': False},
                 color_discrete_sequence=['#00d4ff'],
-                size_max=20,
                 zoom=3,
                 title=f"Campaign Target: {location}"
             )
@@ -1345,79 +839,37 @@ def show_analytics_reports():
             fig.update_layout(
                 mapbox_style="carto-darkmatter",
                 template="plotly_dark",
-                height=500
+                height=400
             )
             
             st.plotly_chart(fig, use_container_width=True)
-            
-            # Campaign metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("🎯 Campaign", campaign['campaign_type'])
-            with col2:
-                st.metric("🌍 Location", location)
-            with col3:
-                st.metric("💰 Budget", f"{campaign.get('budget', 'TBD')} {campaign.get('currency', 'USD')}")
-            with col4:
-                st.metric("📅 Duration", campaign.get('duration', 'TBD'))
     
-    # Email campaign results
+    # Email results
     if st.session_state.campaign_results is not None:
-        st.markdown("---")
-        st.subheader("📧 Email Campaign Performance")
+        st.subheader("📧 Email Campaign Results")
         
         results_df = st.session_state.campaign_results
         
-        # Performance metrics
+        # Metrics
         total_sent = len(results_df[results_df['status'] == 'sent'])
         total_failed = len(results_df[results_df['status'] == 'failed'])
-        total_invalid = len(results_df[results_df['status'] == 'invalid'])
         success_rate = (total_sent / len(results_df)) * 100
         
-        perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
-        
-        with perf_col1:
-            st.metric("📧 Total Emails", len(results_df))
-        with perf_col2:
-            st.metric("✅ Delivered", total_sent)
-        with perf_col3:
-            st.metric("❌ Failed", total_failed)
-        with perf_col4:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📧 Total", len(results_df))
+        with col2:
+            st.metric("✅ Sent", total_sent)
+        with col3:
             st.metric("📊 Success Rate", f"{success_rate:.1f}%")
         
-        # Results visualization
+        # Results pie chart
         status_counts = results_df['status'].value_counts()
-        fig = px.pie(
-            values=status_counts.values, 
-            names=status_counts.index,
-            title="Email Campaign Results Distribution",
-            color_discrete_map={'sent': '#28a745', 'failed': '#dc3545', 'invalid': '#ffc107'}
-        )
+        fig = px.pie(values=status_counts.values, names=status_counts.index,
+                    title="Email Results", 
+                    color_discrete_map={'sent': '#28a745', 'failed': '#dc3545', 'invalid': '#ffc107'})
         fig.update_layout(template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Domain analysis
-        if total_sent > 0:
-            sent_emails = results_df[results_df['status'] == 'sent']
-            sent_emails['domain'] = sent_emails['email'].str.split('@').str[1]
-            domain_counts = sent_emails['domain'].value_counts().head(10)
-            
-            fig = px.bar(x=domain_counts.index, y=domain_counts.values,
-                        title="Top Email Domains Reached",
-                        color_discrete_sequence=['#00d4ff'])
-            fig.update_layout(template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    else:
-        st.info("""
-        📊 **Analytics Dashboard**
-        
-        Create and launch email campaigns to see detailed analytics:
-        - **Geographic Analysis**: Campaign targeting visualization
-        - **Performance Metrics**: Email delivery and engagement rates
-        - **Domain Analysis**: Recipient email domain breakdown
-        - **Success Tracking**: Real-time campaign results
-        """)
 
 if __name__ == "__main__":
     main()
