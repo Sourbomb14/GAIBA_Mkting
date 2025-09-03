@@ -16,6 +16,9 @@ import os
 from datetime import datetime, timedelta
 import io
 import base64
+from groq import Groq
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables
 load_dotenv()
@@ -61,7 +64,7 @@ class EmailPersonalizer:
         return personalized
 
 class EmailHandler:
-    """Handle email operations"""
+    """Handle email operations with proper threading"""
     
     def __init__(self):
         self.smtp_server = "smtp.gmail.com"
@@ -76,10 +79,10 @@ class EmailHandler:
         except EmailNotValidError:
             return False
     
-    def send_email(self, to_email, subject, body, is_html=True):
+    def send_single_email(self, to_email, subject, body, is_html=True):
+        """Send a single email"""
         if not self.email or not self.password:
-            st.error("Email configuration missing. Please check your .env file.")
-            return False
+            return False, "Email configuration missing"
             
         try:
             msg = MIMEMultipart()
@@ -93,30 +96,20 @@ class EmailHandler:
                 msg.attach(MIMEText(body, 'plain'))
             
             context = ssl.create_default_context()
-            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
-            server.starttls(context=context)
-            server.login(self.email, self.password)
-            server.send_message(msg)
-            server.quit()
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls(context=context)
+                server.login(self.email, self.password)
+                server.send_message(msg)
             
-            return True
+            return True, "Success"
         except Exception as e:
-            st.error(f"Email sending failed: {str(e)}")
-            return False
+            return False, str(e)
     
-    def send_bulk_emails(self, email_list, subject, body_template, personalizer):
+    def send_email_batch(self, email_batch, subject, body_template, personalizer):
+        """Send a batch of emails"""
         results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
         
-        total_emails = len(email_list)
-        
-        for index, row in email_list.iterrows():
-            # Update progress
-            progress = (index + 1) / total_emails
-            progress_bar.progress(progress)
-            status_text.text(f"Sending email {index + 1} of {total_emails}...")
-            
+        for _, row in email_batch.iterrows():
             if self.validate_email_address(row['email']):
                 # Personalize the email
                 personalized_body = personalizer.personalize_template(
@@ -130,26 +123,99 @@ class EmailHandler:
                     row['email']
                 )
                 
-                success = self.send_email(row['email'], personalized_subject, personalized_body, is_html=True)
+                success, error_msg = self.send_single_email(
+                    row['email'], 
+                    personalized_subject, 
+                    personalized_body, 
+                    is_html=True
+                )
+                
                 results.append({
                     "email": row['email'],
                     "name": row.get('name', 'Valued Customer'),
-                    "status": "sent" if success else "failed"
+                    "status": "sent" if success else "failed",
+                    "error": error_msg if not success else ""
                 })
                 
-                # Small delay between emails to avoid rate limiting
+                # Small delay between emails
                 time.sleep(1)
             else:
                 results.append({
                     "email": row['email'],
                     "name": row.get('name', 'Valued Customer'),
-                    "status": "invalid"
+                    "status": "invalid",
+                    "error": "Invalid email format"
                 })
         
-        progress_bar.progress(1.0)
-        status_text.text("Campaign completed!")
+        return results
+    
+    def send_bulk_emails(self, email_list, subject, body_template, personalizer, batch_size=10):
+        """Send bulk emails with proper threading and progress tracking"""
+        if not self.email or not self.password:
+            st.error("❌ Email configuration missing. Please check your .env file.")
+            return pd.DataFrame()
         
-        return pd.DataFrame(results)
+        total_emails = len(email_list)
+        all_results = []
+        
+        # Create progress components
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Real-time metrics
+        metrics_container = st.container()
+        with metrics_container:
+            col1, col2, col3, col4 = st.columns(4)
+            sent_metric = col1.metric("✅ Sent", 0)
+            failed_metric = col2.metric("❌ Failed", 0)
+            invalid_metric = col3.metric("⚠️ Invalid", 0)
+            progress_metric = col4.metric("📊 Progress", "0%")
+        
+        sent_count = 0
+        failed_count = 0
+        invalid_count = 0
+        
+        # Process in batches
+        for i in range(0, total_emails, batch_size):
+            batch = email_list.iloc[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            total_batches = (total_emails + batch_size - 1) // batch_size
+            
+            status_text.text(f"📧 Sending batch {batch_num} of {total_batches}...")
+            
+            # Send batch
+            batch_results = self.send_email_batch(batch, subject, body_template, personalizer)
+            all_results.extend(batch_results)
+            
+            # Update counters
+            for result in batch_results:
+                if result['status'] == 'sent':
+                    sent_count += 1
+                elif result['status'] == 'failed':
+                    failed_count += 1
+                elif result['status'] == 'invalid':
+                    invalid_count += 1
+            
+            # Update progress
+            progress = (i + len(batch)) / total_emails
+            progress_bar.progress(progress)
+            
+            # Update metrics
+            with metrics_container:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("✅ Sent", sent_count)
+                col2.metric("❌ Failed", failed_count)
+                col3.metric("⚠️ Invalid", invalid_count)
+                col4.metric("📊 Progress", f"{progress * 100:.1f}%")
+            
+            # Delay between batches
+            if i + batch_size < total_emails:
+                time.sleep(2)
+        
+        progress_bar.progress(1.0)
+        status_text.text("🎉 Campaign completed!")
+        
+        return pd.DataFrame(all_results)
 
 class FileProcessor:
     """Handle file processing for contact extraction"""
@@ -256,83 +322,223 @@ class FileProcessor:
         return result_df
 
 class CampaignGenerator:
-    """Generate campaign content using AI (mock implementation)"""
+    """Generate campaign content using Groq API"""
+    
+    def __init__(self):
+        self.client = None
+        if GROQ_API_KEY:
+            try:
+                self.client = Groq(api_key=GROQ_API_KEY)
+            except Exception as e:
+                st.error(f"Failed to initialize Groq client: {e}")
     
     def generate_campaign_blueprint(self, campaign_data):
-        """Generate campaign blueprint"""
+        """Generate campaign blueprint using Groq API"""
+        if not self.client:
+            return self._fallback_campaign_blueprint(campaign_data)
+        
+        try:
+            company_name = campaign_data.get('company_name', 'Your Company')
+            campaign_type = campaign_data.get('campaign_type', 'Marketing Campaign')
+            target_audience = campaign_data.get('target_audience', 'General audience')
+            channels = ', '.join(campaign_data.get('channels', ['Email']))
+            location = campaign_data.get('location', 'Global')
+            budget = campaign_data.get('budget', 'Not specified')
+            product_description = campaign_data.get('product_description', 'Product/Service')
+            
+            prompt = f"""
+            Create a comprehensive marketing campaign blueprint for {company_name}.
+            
+            Campaign Details:
+            - Campaign Type: {campaign_type}
+            - Target Audience: {target_audience}
+            - Marketing Channels: {channels}
+            - Geographic Location: {location}
+            - Budget: {budget}
+            - Product/Service: {product_description}
+            
+            Please provide a detailed campaign blueprint including:
+            1. Executive Summary
+            2. Campaign Objectives (SMART goals)
+            3. Target Audience Analysis (demographics, psychographics, pain points)
+            4. Key Messages & Value Proposition
+            5. Marketing Channels Strategy (specific tactics for each channel)
+            6. Campaign Timeline (pre-launch, launch, post-launch phases)
+            7. Budget Allocation (breakdown by channel and activity)
+            8. Success Metrics & KPIs (specific, measurable metrics)
+            9. Risk Assessment & Mitigation Strategies
+            10. Call-to-Action Strategy
+            
+            Make it professional, actionable, and tailored to the specific business and audience.
+            """
+            
+            response = self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert marketing strategist with 15+ years of experience creating successful marketing campaigns. Provide detailed, actionable, and professional marketing strategies."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                model="mixtral-8x7b-32768",
+                temperature=0.7,
+                max_tokens=4000
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            st.error(f"Error generating campaign with Groq API: {e}")
+            return self._fallback_campaign_blueprint(campaign_data)
+    
+    def generate_email_template(self, campaign_brief, tone="professional"):
+        """Generate email template using Groq API"""
+        if not self.client:
+            return self._fallback_email_template()
+        
+        try:
+            prompt = f"""
+            Create a professional HTML email template based on this campaign brief:
+            {campaign_brief}
+            
+            Requirements:
+            - Tone: {tone}
+            - Include proper HTML structure with inline CSS
+            - Make it mobile-responsive
+            - Include personalization placeholders: {{{{first_name}}}}, {{{{name}}}}
+            - Include a clear call-to-action button
+            - Add professional styling with modern design
+            - Include header, body content, CTA, and footer sections
+            - Use a color scheme that's professional and engaging
+            - Make sure it works well in email clients
+            
+            The email should be engaging, conversion-focused, and brand-appropriate.
+            """
+            
+            response = self.client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert email marketing designer. Create professional, conversion-optimized HTML email templates that work across all email clients."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                model="mixtral-8x7b-32768",
+                temperature=0.6,
+                max_tokens=3000
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            st.error(f"Error generating email template with Groq API: {e}")
+            return self._fallback_email_template()
+    
+    def _fallback_campaign_blueprint(self, campaign_data):
+        """Fallback campaign blueprint when API is not available"""
         company_name = campaign_data.get('company_name', 'Your Company')
         campaign_type = campaign_data.get('campaign_type', 'Marketing Campaign')
         target_audience = campaign_data.get('target_audience', 'General audience')
         channels = ', '.join(campaign_data.get('channels', ['Email']))
         
-        blueprint = f"""
+        return f"""
 # {company_name} - {campaign_type} Campaign Blueprint
 
 ## Executive Summary
 This {campaign_type.lower()} campaign for {company_name} is designed to engage {target_audience} through strategic messaging across {channels}.
 
 ## Campaign Objectives
-- Increase brand awareness and engagement
-- Drive conversions and sales
+- Increase brand awareness and market presence
+- Drive qualified leads and conversions
 - Build customer loyalty and retention
-- Expand market reach
+- Expand market reach in target segments
+- Achieve measurable ROI and business growth
 
 ## Target Audience Analysis
 **Primary Audience:** {target_audience}
 - Demographics: Based on provided audience description
-- Psychographics: Interests and behaviors aligned with campaign goals
+- Psychographics: Interests, values, and behaviors aligned with campaign goals
+- Pain Points: Challenges our product/service can solve
 - Channel Preferences: {channels}
+- Decision-making process and buyer journey considerations
 
-## Key Messages & Positioning
-- Value proposition highlighting unique benefits
-- Clear and compelling call-to-action
-- Brand-consistent messaging tone
-- Customer-focused benefits
+## Key Messages & Value Proposition
+- **Primary Message:** Clear value proposition highlighting unique benefits
+- **Supporting Messages:** Feature-specific benefits and social proof
+- **Emotional Appeal:** Connect with audience's aspirations and pain points
+- **Differentiation:** What sets us apart from competitors
+- **Call-to-Action:** Clear, compelling action for prospects to take
 
 ## Marketing Channels Strategy
 **Selected Channels:** {channels}
-- Email Marketing: Personalized campaigns with high engagement
-- Social Media: Brand awareness and community building
-- Digital Advertising: Targeted reach and conversions
+
+**Email Marketing:**
+- Segmented campaigns based on audience personas
+- Automated drip sequences for nurturing leads
+- Personalized content based on user behavior
+- A/B testing for subject lines and content
+
+**Additional Channels:**
+- Social Media: Community building and brand awareness
+- Content Marketing: Educational and thought leadership content
+- Paid Advertising: Targeted campaigns for lead generation
 
 ## Campaign Timeline
-**Phase 1 - Pre-Launch (Week 1-2)**
-- Content creation and approval
-- Audience segmentation and list building
-- Testing and quality assurance
 
-**Phase 2 - Launch (Week 3-4)**
-- Campaign deployment across all channels
-- Real-time monitoring and optimization
-- Customer service support preparation
+**Phase 1 - Pre-Launch (Weeks 1-2)**
+- Finalize creative assets and copy
+- Set up tracking and analytics
+- Prepare email lists and segmentation
+- Conduct final testing and quality assurance
 
-**Phase 3 - Post-Launch (Week 5-6)**
-- Performance analysis and reporting
-- Follow-up campaigns and nurturing
-- Lessons learned and optimization
+**Phase 2 - Launch (Weeks 3-4)**
+- Deploy campaigns across all channels
+- Monitor performance and optimize in real-time
+- Respond to customer inquiries and feedback
+- Adjust targeting and messaging based on early results
+
+**Phase 3 - Post-Launch (Weeks 5-6)**
+- Analyze performance data and generate insights
+- Conduct follow-up campaigns for non-converters
+- Gather customer feedback and testimonials
+- Plan next phase or follow-up campaigns
 
 ## Success Metrics (KPIs)
-- Email open rates: Target 25%+
-- Click-through rates: Target 3%+
-- Conversion rates: Target 2%+
-- ROI: Target 300%+
+- **Email Marketing:** Open rates (25%+), Click rates (3%+), Conversion rates (2%+)
+- **Lead Generation:** Cost per lead, Lead quality score, Lead-to-customer conversion
+- **Revenue:** Return on ad spend (ROAS), Customer acquisition cost (CAC)
+- **Engagement:** Social media engagement, Website traffic, Content consumption
 
 ## Budget Allocation
-- Content Creation: 30%
-- Media Spend: 40%
-- Technology & Tools: 20%
-- Contingency: 10%
+- Creative Development: 25%
+- Media/Advertising Spend: 45%
+- Technology and Tools: 15%
+- Analytics and Reporting: 10%
+- Contingency Fund: 5%
 
-## Risk Assessment
-- Low engagement: Mitigate with A/B testing
-- Technical issues: Have backup systems ready
-- Competitive response: Monitor and adapt quickly
+## Risk Assessment & Mitigation
+- **Low Engagement Risk:** Mitigate with A/B testing and audience research
+- **Technical Issues:** Have backup systems and redundancy plans
+- **Competitive Response:** Monitor competitor activities and be ready to adapt
+- **Budget Overruns:** Regular monitoring and approval processes for additional spend
+
+## Next Steps
+1. Approve campaign strategy and budget
+2. Begin creative asset development
+3. Set up tracking and measurement systems
+4. Finalize audience lists and targeting
+5. Launch campaign according to timeline
 """
-        return blueprint
     
-    def generate_email_template(self, campaign_brief, tone="professional"):
-        """Generate email template"""
-        template = f'''
+    def _fallback_email_template(self):
+        """Fallback email template when API is not available"""
+        return '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -340,84 +546,155 @@ This {campaign_type.lower()} campaign for {company_name} is designed to engage {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Campaign Email</title>
     <style>
-        body {{ 
-            font-family: Arial, sans-serif; 
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
             line-height: 1.6; 
             color: #333; 
             max-width: 600px; 
             margin: 0 auto; 
-            padding: 20px; 
-        }}
-        .header {{ 
-            background-color: #007bff; 
+            padding: 0; 
+            background-color: #f4f4f4;
+        }
+        .email-container {
+            background-color: #ffffff;
+            margin: 20px auto;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .header { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white; 
-            padding: 20px; 
+            padding: 30px 20px; 
             text-align: center; 
-            border-radius: 5px 5px 0 0; 
-        }}
-        .content {{ 
-            background-color: #f8f9fa; 
-            padding: 30px; 
-            border-radius: 0 0 5px 5px; 
-        }}
-        .cta-button {{ 
-            background-color: #28a745; 
-            color: white; 
-            padding: 12px 25px; 
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 600;
+        }
+        .content { 
+            padding: 40px 30px; 
+            background-color: #ffffff;
+        }
+        .content h2 {
+            color: #333;
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+        .content p {
+            margin-bottom: 16px;
+            color: #555;
+            font-size: 16px;
+        }
+        .cta-button { 
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            color: white !important; 
+            padding: 15px 30px; 
             text-decoration: none; 
-            border-radius: 5px; 
+            border-radius: 6px; 
             display: inline-block; 
-            margin: 20px 0; 
-            font-weight: bold; 
-        }}
-        .footer {{ 
+            margin: 25px 0; 
+            font-weight: 600;
+            font-size: 16px;
+            text-align: center;
+            transition: transform 0.2s ease;
+        }
+        .cta-button:hover {
+            transform: translateY(-2px);
+        }
+        .features {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 6px;
+            margin: 20px 0;
+        }
+        .features ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+        .features li {
+            margin-bottom: 8px;
+            color: #555;
+        }
+        .footer { 
             text-align: center; 
-            padding: 20px; 
-            font-size: 12px; 
-            color: #666; 
-        }}
+            padding: 30px 20px; 
+            background-color: #f8f9fa;
+            border-top: 1px solid #dee2e6;
+            color: #6c757d;
+        }
+        .footer p {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        .footer a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        @media only screen and (max-width: 600px) {
+            .email-container {
+                margin: 0;
+                border-radius: 0;
+            }
+            .content {
+                padding: 20px 15px;
+            }
+            .header {
+                padding: 20px 15px;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>Exciting News from Our Team!</h1>
-    </div>
-    
-    <div class="content">
-        <p>Hello {{{{first_name}}}},</p>
+    <div class="email-container">
+        <div class="header">
+            <h1>🚀 Exciting News Awaits!</h1>
+        </div>
         
-        <p>We hope this message finds you well. We're thrilled to share some exciting updates with you!</p>
+        <div class="content">
+            <h2>Hello {{first_name}},</h2>
+            
+            <p>We hope this message finds you well! We're thrilled to share something special that we believe will make a real difference for you.</p>
+            
+            <p>As someone who values innovation and quality, we thought you'd be excited to learn about our latest campaign. We've been working tirelessly to bring you an experience that's tailored exactly to what you need.</p>
+            
+            <div class="features">
+                <p><strong>Here's what makes this opportunity special:</strong></p>
+                <ul>
+                    <li>✨ Personalized experience designed with you in mind</li>
+                    <li>🎯 Exclusive benefits for our valued community members</li>
+                    <li>⏰ Limited-time opportunity to be among the first</li>
+                    <li>🔒 Backed by our commitment to quality and results</li>
+                </ul>
+            </div>
+            
+            <p>We believe this will bring significant value to your experience with us, and we can't wait for you to see what we've prepared.</p>
+            
+            <center>
+                <a href="https://example.com/campaign" class="cta-button">Discover What's New →</a>
+            </center>
+            
+            <p>Thank you for being such an important part of our community. Your trust and support mean everything to us, and we're excited to continue this journey together.</p>
+            
+            <p>Best regards,<br>
+            <strong>The Team</strong><br>
+            <em>Your Company Name</em></p>
+        </div>
         
-        <p>As someone who values quality and innovation, we thought you'd be interested in our latest campaign. We've been working hard to bring you something special that aligns perfectly with your interests.</p>
-        
-        <p>Here's what makes this campaign special:</p>
-        <ul>
-            <li>Personalized experience tailored just for you</li>
-            <li>Exclusive benefits for our valued community</li>
-            <li>Limited-time opportunity to be part of something amazing</li>
-        </ul>
-        
-        <p>We believe this campaign will bring significant value to your experience with us.</p>
-        
-        <center>
-            <a href="https://example.com/campaign" class="cta-button">Learn More</a>
-        </center>
-        
-        <p>Thank you for being an important part of our community. We look forward to sharing this journey with you!</p>
-        
-        <p>Best regards,<br>
-        <strong>The Marketing Team</strong><br>
-        Your Company Name</p>
-    </div>
-    
-    <div class="footer">
-        <p>You received this email because you're a valued member of our community.</p>
-        <p><a href="#unsubscribe">Unsubscribe</a> | <a href="#preferences">Email Preferences</a></p>
+        <div class="footer">
+            <p>You received this email because you're a valued member of our community.</p>
+            <p>
+                <a href="#unsubscribe">Unsubscribe</a> | 
+                <a href="#preferences">Email Preferences</a> | 
+                <a href="#contact">Contact Us</a>
+            </p>
+            <p>© 2024 Your Company Name. All rights reserved.</p>
+        </div>
     </div>
 </body>
 </html>
 '''
-        return template
 
 # ================================
 # STREAMLIT APP CONFIGURATION
@@ -480,15 +757,6 @@ st.markdown("""
         border-radius: 8px !important;
     }
     
-    /* Metrics */
-    .metric-container {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        border: 1px solid #333;
-        margin: 0.5rem 0;
-    }
-    
     /* Success/Error messages */
     .stSuccess {
         background-color: #1a4d3a !important;
@@ -505,19 +773,6 @@ st.markdown("""
     .stWarning {
         background-color: #4d3a1a !important;
         border: 1px solid #ffc107 !important;
-        border-radius: 8px !important;
-    }
-    
-    /* Dataframes */
-    .stDataFrame {
-        background-color: #1e1e1e !important;
-        border-radius: 8px !important;
-    }
-    
-    /* Expanders */
-    .streamlit-expanderHeader {
-        background-color: #1a1a2e !important;
-        color: #00d4ff !important;
         border-radius: 8px !important;
     }
 </style>
@@ -611,7 +866,7 @@ def main():
         show_analytics_reports()
 
 def show_campaign_dashboard():
-    st.header("🎯 Campaign Strategy Generator")
+    st.header("🎯 AI-Powered Campaign Strategy Generator")
     
     with st.form("campaign_form"):
         col1, col2 = st.columns(2)
@@ -655,7 +910,7 @@ def show_campaign_dashboard():
         product_description = st.text_area("📦 Product/Service Description",
             placeholder="Describe what you're promoting in this campaign...")
         
-        submitted = st.form_submit_button("🚀 Generate Campaign Blueprint", 
+        submitted = st.form_submit_button("🚀 Generate AI Campaign Blueprint", 
             use_container_width=True)
     
     if submitted and company_name and campaign_type:
@@ -671,17 +926,18 @@ def show_campaign_dashboard():
             'product_description': product_description
         }
         
-        with st.spinner("🤖 AI is generating your campaign strategy..."):
+        with st.spinner("🤖 AI is analyzing your requirements and generating a comprehensive campaign strategy..."):
             generator = CampaignGenerator()
             blueprint = generator.generate_campaign_blueprint(campaign_data)
             
             st.session_state['current_campaign'] = campaign_data
             st.session_state['campaign_blueprint'] = blueprint
             
-            st.success("✨ Campaign blueprint generated successfully!")
+            st.success("✨ AI-powered campaign blueprint generated successfully!")
+            st.balloons()
             
             # Display blueprint
-            st.markdown("## 📋 Your Campaign Blueprint")
+            st.markdown("## 📋 Your AI-Generated Campaign Blueprint")
             st.markdown(blueprint)
             
             # Action buttons
@@ -705,7 +961,7 @@ def show_campaign_dashboard():
         st.error("⚠️ Please fill in at least Company Name and Campaign Type")
 
 def show_email_marketing():
-    st.header("📧 Email Marketing Center")
+    st.header("📧 AI Email Marketing Center")
     
     email_handler = EmailHandler()
     personalizer = EmailPersonalizer()
@@ -733,15 +989,15 @@ def show_email_marketing():
         tone = st.selectbox("🎭 Tone", ["Professional", "Friendly", "Casual", "Urgent", "Formal"])
     
     with template_col2:
-        if st.button("🚀 Generate Email Template", type="primary"):
+        if st.button("🚀 Generate AI Email Template", type="primary"):
             if 'current_campaign' in st.session_state:
                 campaign_brief = st.session_state.get('campaign_blueprint', 'Marketing campaign')
                 generator = CampaignGenerator()
                 
-                with st.spinner("🤖 Generating personalized email template..."):
+                with st.spinner("🤖 AI is crafting your personalized email template..."):
                     template = generator.generate_email_template(campaign_brief, tone.lower())
                     st.session_state['email_template'] = template
-                    st.success("✨ Email template generated!")
+                    st.success("✨ AI email template generated successfully!")
             else:
                 st.warning("⚠️ Please create a campaign first")
     
@@ -866,8 +1122,9 @@ def show_email_marketing():
         with campaign_col2:
             test_email = st.text_input("🧪 Test Email (Optional)", 
                 placeholder="your-email@example.com")
-            batch_delay = st.number_input("⏱️ Delay Between Emails (seconds)", 
-                min_value=1, max_value=10, value=2)
+            batch_size = st.number_input("📦 Batch Size", 
+                min_value=1, max_value=50, value=10,
+                help="Number of emails to send in each batch")
         
         # Test email
         if test_email and st.button("🧪 Send Test Email"):
@@ -877,7 +1134,7 @@ def show_email_marketing():
                 test_email
             )
             
-            success = email_handler.send_email(
+            success, error_msg = email_handler.send_single_email(
                 test_email, 
                 f"[TEST] {subject}", 
                 test_template, 
@@ -887,7 +1144,7 @@ def show_email_marketing():
             if success:
                 st.success("✅ Test email sent successfully!")
             else:
-                st.error("❌ Failed to send test email")
+                st.error(f"❌ Failed to send test email: {error_msg}")
         
         # Launch campaign
         st.markdown("### 🎯 Campaign Launch")
@@ -900,38 +1157,43 @@ def show_email_marketing():
             st.warning("⚠️ You are about to send emails to all contacts. This cannot be undone!")
             
             if st.button("✅ CONFIRM LAUNCH"):
-                with st.spinner("📧 Sending campaign emails..."):
+                with st.spinner("📧 Launching email campaign..."):
                     results = email_handler.send_bulk_emails(
-                        df, subject, st.session_state['email_template'], personalizer
+                        df, subject, st.session_state['email_template'], personalizer, batch_size
                     )
                     
-                    # Show results
-                    success_count = len(results[results['status'] == 'sent'])
-                    failed_count = len(results[results['status'] == 'failed'])
-                    invalid_count = len(results[results['status'] == 'invalid'])
-                    
-                    st.success("🎉 Campaign completed!")
-                    
-                    result_col1, result_col2, result_col3 = st.columns(3)
-                    
-                    with result_col1:
-                        st.metric("✅ Sent", success_count)
-                    with result_col2:
-                        st.metric("❌ Failed", failed_count)
-                    with result_col3:
-                        st.metric("⚠️ Invalid", invalid_count)
-                    
-                    # Store results for analytics
-                    st.session_state['campaign_results'] = results
-                    
-                    # Download results
-                    csv = results.to_csv(index=False)
-                    st.download_button(
-                        "📥 Download Results",
-                        data=csv,
-                        file_name=f"campaign_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv"
-                    )
+                    if not results.empty:
+                        # Show results
+                        success_count = len(results[results['status'] == 'sent'])
+                        failed_count = len(results[results['status'] == 'failed'])
+                        invalid_count = len(results[results['status'] == 'invalid'])
+                        
+                        st.success("🎉 Campaign completed!")
+                        
+                        result_col1, result_col2, result_col3 = st.columns(3)
+                        
+                        with result_col1:
+                            st.metric("✅ Sent", success_count)
+                        with result_col2:
+                            st.metric("❌ Failed", failed_count)
+                        with result_col3:
+                            st.metric("⚠️ Invalid", invalid_count)
+                        
+                        # Store results for analytics
+                        st.session_state['campaign_results'] = results
+                        
+                        # Download results
+                        csv = results.to_csv(index=False)
+                        st.download_button(
+                            "📥 Download Results",
+                            data=csv,
+                            file_name=f"campaign_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                            mime="text/csv"
+                        )
+                        
+                        # Show detailed results
+                        with st.expander("📋 View Detailed Results"):
+                            st.dataframe(results, use_container_width=True)
     
     # Quick single email
     st.markdown("---")
@@ -960,12 +1222,12 @@ def show_email_marketing():
                 final_name = recipient_name if recipient_name else personalizer.extract_name_from_email(recipient)
                 final_body = personalizer.personalize_template(body, final_name, recipient)
                 
-                success = email_handler.send_email(recipient, single_subject, final_body, is_html=True)
+                success, error_msg = email_handler.send_single_email(recipient, single_subject, final_body, is_html=True)
                 
                 if success:
                     st.success(f"✅ Email sent to {final_name} ({recipient})!")
                 else:
-                    st.error("❌ Failed to send email")
+                    st.error(f"❌ Failed to send email: {error_msg}")
             else:
                 st.error("⚠️ Please fill in all required fields")
 
@@ -1255,31 +1517,6 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # Detailed results
             with st.expander("📋 View Detailed Results"):
                 st.dataframe(results_df, use_container_width=True)
-
-# ================================
-# REQUIREMENTS.TXT
-# ================================
-"""
-streamlit
-pandas
-numpy
-plotly
-email-validator
-python-dotenv
-openpyxl
-"""
-
-# ================================
-# .ENV TEMPLATE
-# ================================
-"""
-# Email Configuration
-GMAIL_USER=your_email@gmail.com
-GMAIL_APP_PASSWORD=your_16_digit_app_password
-
-# AI Configuration (Optional)
-GROQ_API_KEY=your_groq_api_key_here
-"""
 
 if __name__ == "__main__":
     main()
