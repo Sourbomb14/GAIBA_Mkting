@@ -5,3 +5,4 @@ plotly
 email-validator
 python-dotenv
 openpyxl
+groq
